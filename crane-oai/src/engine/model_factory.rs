@@ -9,7 +9,9 @@ use serde::Deserialize;
 use std::path::Path;
 
 use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
-use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
+use crate::chat_template::{
+    AutoChatTemplate, ChatTemplateProcessor, Gemma4ChatTemplate, HunyuanChatTemplate,
+};
 
 // ─────────────────────────────────────────────────────────────
 //  Enums
@@ -252,6 +254,7 @@ pub fn create_chat_template(
                 Err(_) => Box::new(HunyuanChatTemplate),
             }
         }
+        ModelType::Gemma4 => Box::new(Gemma4ChatTemplate),
         _ => match AutoChatTemplate::new(model_path) {
             Ok(t) => Box::new(t),
             Err(e) => {

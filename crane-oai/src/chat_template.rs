@@ -104,6 +104,45 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
     }
 }
 
+/// Text-only chat template for Gemma 4 style chat models.
+///
+/// Mirrors the core turn format from the official Gemma 4 template:
+/// `<bos><|turn>{role}\n{content}<turn|>\n...<|turn>model\n`
+pub struct Gemma4ChatTemplate;
+
+impl ChatTemplateProcessor for Gemma4ChatTemplate {
+    fn apply(&self, messages: &[ChatMessage]) -> Result<String, String> {
+        const BOS: &str = "<bos>";
+        const TURN_OPEN: &str = "<|turn>";
+        const TURN_CLOSE: &str = "<turn|>";
+
+        let mut out = String::new();
+        out.push_str(BOS);
+
+        for msg in messages {
+            let role = match msg.role.as_str() {
+                "assistant" => "model",
+                "user" => "user",
+                "system" | "developer" => "system",
+                _ => continue,
+            };
+
+            out.push_str(TURN_OPEN);
+            out.push_str(role);
+            out.push('\n');
+            out.push_str(msg.text_content().trim());
+            out.push_str(TURN_CLOSE);
+            out.push('\n');
+        }
+
+        // Add generation prompt for assistant/model continuation.
+        out.push_str(TURN_OPEN);
+        out.push_str("model\n");
+
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::openai_api::ChatMessageContent;
