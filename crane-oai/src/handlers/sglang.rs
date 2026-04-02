@@ -20,13 +20,21 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::engine::EngineResponse;
+use crate::engine::{types::MultimodalInputs, EngineResponse};
 use crate::openai_api::ErrorResponse;
 use crate::sglang_api::*;
 use crate::{make_error, AppState};
 
 use super::sse;
 use super::vlm;
+
+fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
+    if state.model_type_name.eq_ignore_ascii_case("gemma4") {
+        (Some(1.0), Some(0.95), Some(64))
+    } else {
+        (Some(0.8), Some(0.95), Some(20))
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 //  /generate
@@ -63,22 +71,42 @@ pub async fn generate(
     };
 
     let sp = &req.sampling_params;
+    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
     let request_id = req
         .rid
         .unwrap_or_else(|| format!("gen-{}", uuid::Uuid::new_v4()));
+    let multimodal_inputs = req
+        .image_url
+        .clone()
+        .map(|url| MultimodalInputs {
+            image_urls: vec![url],
+            audio_urls: vec![],
+        })
+        .unwrap_or_default();
+
+    if !multimodal_inputs.image_urls.is_empty() && !state.accepts_image_inputs {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            "Loaded model does not support image inputs",
+        ));
+    }
 
     let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+        make_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Text engine not available (VLM model loaded)",
+        )
     })?;
 
     let response_rx = engine
-        .submit(
+        .submit_with_multimodal(
             request_id.clone(),
             input_ids,
+            multimodal_inputs,
             sp.max_new_tokens,
-            sp.temperature.or(Some(0.8)),
-            sp.top_p.or(Some(0.95)),
-            sp.top_k.or(Some(20)),
+            sp.temperature.or(default_temperature),
+            sp.top_p.or(default_top_p),
+            sp.top_k.or(default_top_k),
             sp.repetition_penalty,
             state.eos_token_id.clone(),
         )
@@ -142,6 +170,8 @@ pub async fn model_info(State(state): State<Arc<AppState>>) -> impl IntoResponse
         model_path: state.model_path.clone(),
         model_type: state.model_type_name.clone(),
         is_generation: true,
+        accepts_image_inputs: state.accepts_image_inputs,
+        accepts_audio_inputs: state.accepts_audio_inputs,
         dtype: Some(state.dtype_name.clone()),
         device: Some(state.device_name.clone()),
         max_model_len: None,
@@ -154,7 +184,11 @@ pub async fn model_info(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// `GET /server_info` — server configuration + live stats.
 pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = state.engine.as_ref().map(|e| e.stats.snapshot()).unwrap_or_default();
+    let stats = state
+        .engine
+        .as_ref()
+        .map(|e| e.stats.snapshot())
+        .unwrap_or_default();
     Json(ServerInfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model_path: state.model_path.clone(),
@@ -184,14 +218,17 @@ pub async fn health_generate(
     let request_id = format!("health-{}", uuid::Uuid::new_v4());
 
     let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+        make_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Text engine not available (VLM model loaded)",
+        )
     })?;
 
     let response_rx = engine
         .submit(
             request_id,
             probe_tokens,
-            1, // generate just 1 token
+            1,         // generate just 1 token
             Some(0.0), // greedy
             None,
             None,
@@ -256,9 +293,7 @@ pub async fn flush_cache() -> impl IntoResponse {
 /// Currently, clients can cancel by dropping their SSE connection (which the
 /// engine detects automatically). This endpoint is provided for API compatibility;
 /// explicit abort via engine control channel is a future enhancement.
-pub async fn abort_request(
-    Json(req): Json<AbortRequest>,
-) -> impl IntoResponse {
+pub async fn abort_request(Json(req): Json<AbortRequest>) -> impl IntoResponse {
     // TODO: Add explicit abort via engine control channel.
     Json(AbortResponse {
         success: true,

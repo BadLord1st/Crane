@@ -82,10 +82,44 @@ impl ChatMessage {
                 .iter()
                 .filter_map(|p| match p {
                     ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                    ContentPart::Image {
+                        image_url: Some(image_url),
+                    } => Some(image_url.url.clone()),
                     _ => None,
                 })
                 .collect(),
         }
+    }
+
+    /// Extract audio URLs from multimodal content.
+    pub fn audio_urls(&self) -> Vec<String> {
+        match &self.content {
+            ChatMessageContent::Text(_) => vec![],
+            ChatMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::AudioUrl { audio_url } => Some(audio_url.url.clone()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this message contains non-text multimodal parts.
+    pub fn has_multimodal_parts(&self) -> bool {
+        match &self.content {
+            ChatMessageContent::Text(_) => false,
+            ChatMessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| !matches!(p, ContentPart::Text { .. })),
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    /// Whether any request message includes multimodal content parts.
+    pub fn has_multimodal_inputs(&self) -> bool {
+        self.messages.iter().any(ChatMessage::has_multimodal_parts)
     }
 }
 
@@ -97,6 +131,18 @@ pub enum ChatMessageContent {
     Text(String),
     /// Structured content with text and/or image_url parts.
     Parts(Vec<ContentPart>),
+}
+
+impl From<&str> for ChatMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
 }
 
 /// A single content part in a multimodal message.
@@ -112,11 +158,20 @@ pub enum ContentPart {
     /// Image content (alternative key used by some OpenAI clients).
     #[serde(rename = "image")]
     Image { image_url: Option<ImageUrl> },
+    /// Audio URL content.
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
 }
 
 /// An image URL reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
+    pub url: String,
+}
+
+/// An audio URL reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioUrl {
     pub url: String,
 }
 
@@ -458,7 +513,7 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, "user");
-        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.text_content(), "Hello!");
     }
 
     // ── ChatCompletionRequest deserialization ──

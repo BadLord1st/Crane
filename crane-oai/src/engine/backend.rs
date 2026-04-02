@@ -14,6 +14,8 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
+use super::types::MultimodalInputs;
+
 // ─────────────────────────────────────────────────────────────
 //  Trait
 // ─────────────────────────────────────────────────────────────
@@ -31,6 +33,18 @@ pub trait ModelBackend: Send + 'static {
     ///
     /// Returns logits tensor, typically `[1, seq_len, vocab_size]`.
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor>;
+
+    /// Prefill forward that may consume multimodal payload.
+    ///
+    /// Default implementation preserves text-only behavior.
+    fn forward_prefill(
+        &mut self,
+        input_ids: &[u32],
+        start_pos: usize,
+        _multimodal_inputs: &MultimodalInputs,
+    ) -> Result<Tensor> {
+        self.forward_step(input_ids, start_pos)
+    }
 
     /// Clear all KV caches.
     fn clear_kv_cache(&mut self);
@@ -477,6 +491,22 @@ impl ModelBackend for Gemma4Backend {
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         self.model
             .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn forward_prefill(
+        &mut self,
+        input_ids: &[u32],
+        start_pos: usize,
+        multimodal_inputs: &MultimodalInputs,
+    ) -> Result<Tensor> {
+        self.model
+            .forward_step_with_multimodal(
+                input_ids,
+                start_pos,
+                &multimodal_inputs.image_urls,
+                &multimodal_inputs.audio_urls,
+            )
             .map_err(Into::into)
     }
 

@@ -2,6 +2,8 @@ use candle_core::Tensor;
 use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 
+use super::types::MultimodalInputs;
+
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
 pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
     caches
@@ -37,6 +39,8 @@ pub struct Sequence {
     // ── token state ──
     /// Full token list: prompt ++ generated.
     pub tokens: Vec<u32>,
+    /// Original multimodal payload attached to the request.
+    pub multimodal_inputs: MultimodalInputs,
     /// Length of the original prompt (tokens before generation started).
     pub prompt_len: usize,
 
@@ -136,6 +140,7 @@ mod tests {
             id: "test-seq".into(),
             status,
             tokens,
+            multimodal_inputs: MultimodalInputs::default(),
             prompt_len: prompt.len(),
             kv_caches: vec![],
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),

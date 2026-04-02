@@ -138,9 +138,7 @@ impl Module for RmsNorm {
         let x = x.to_dtype(internal_dtype)?;
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        x_normed
-            .to_dtype(x_dtype)?
-            .broadcast_mul(&(&self.weight + 1.0)?)
+        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
     }
 }
 
@@ -321,7 +319,8 @@ impl Attention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-    ) -> candle_core::Result<Tensor> {
+        shared_kv: Option<(&Tensor, &Tensor)>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         let query_states = self.q_proj.forward(xs)?;
@@ -334,27 +333,47 @@ impl Attention {
         let key_states = key_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let value_states = value_states
+        let mut value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
         let query_states = self.q_norm.forward(&query_states)?;
         let key_states = self.k_norm.forward(&key_states)?;
 
+        // Gemma4 text attention applies RMSNorm to V without learnable scale.
+        {
+            let v_dtype = value_states.dtype();
+            let v_internal_dtype = match v_dtype {
+                DType::F16 | DType::BF16 => DType::F32,
+                d => d,
+            };
+            let h = value_states.dim(D::Minus1)?;
+            let v = value_states.to_dtype(v_internal_dtype)?;
+            let norm_v = (v.sqr()?.sum_keepdim(D::Minus1)? / h as f64)?;
+            value_states = v
+                .broadcast_div(&(norm_v + 1e-6)?.sqrt()?)?
+                .to_dtype(v_dtype)?;
+        }
+
         let (query_states, key_states) =
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states) = match &mut self.kv_cache {
-            KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
-            KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+        let (key_states, value_states, produced_kv) = if let Some((k, v)) = shared_kv {
+            (k.clone(), v.clone(), None)
+        } else {
+            let (k, v) = match &mut self.kv_cache {
+                KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
+                KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+            };
+            (k.clone(), v.clone(), Some((k, v)))
         };
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
-        let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+        // Gemma4 text eager-attention path uses scaling=1.0.
+        let attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
         let attn_weights = match attention_mask {
             None => attn_weights,
@@ -363,10 +382,11 @@ impl Attention {
         let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
         let attn_output = attn_weights.matmul(&value_states)?;
 
-        attn_output
+        let out = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj)
+            .apply(&self.o_proj)?;
+        Ok((out, produced_kv))
     }
 
     fn clear_kv_cache(&mut self) {
@@ -470,10 +490,13 @@ impl DecoderLayer {
         per_layer_input: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-    ) -> candle_core::Result<Tensor> {
+        shared_kv: Option<(&Tensor, &Tensor)>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let (xs, produced_kv) =
+            self.self_attn
+                .forward(&xs, attention_mask, seqlen_offset, shared_kv)?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = (xs + residual)?;
 
@@ -502,7 +525,7 @@ impl DecoderLayer {
             xs = (residual + x_gate)?;
         }
 
-        xs.broadcast_mul(&self.layer_scalar)
+        Ok((xs.broadcast_mul(&self.layer_scalar)?, produced_kv))
     }
 
     fn clear_kv_cache(&mut self) {
@@ -560,6 +583,7 @@ pub struct Gemma4TextModel {
     dtype: DType,
     hidden_size: usize,
     hidden_size_per_layer_input: usize,
+    shared_kv_source: Vec<Option<usize>>,
 }
 
 impl Gemma4TextModel {
@@ -601,6 +625,20 @@ impl Gemma4TextModel {
             layers.push(DecoderLayer::new(cfg, layer_idx, vb_l.pp(layer_idx))?);
         }
 
+        let first_shared_layer = cfg
+            .num_hidden_layers
+            .saturating_sub(cfg.num_kv_shared_layers.unwrap_or(0));
+        let mut shared_kv_source = vec![None; cfg.num_hidden_layers];
+        if first_shared_layer > 0 {
+            for layer_idx in first_shared_layer..cfg.num_hidden_layers {
+                let lt = cfg.layer_type(layer_idx);
+                let src = (0..first_shared_layer)
+                    .rev()
+                    .find(|&j| cfg.layer_type(j) == lt);
+                shared_kv_source[layer_idx] = src;
+            }
+        }
+
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
 
@@ -617,6 +655,7 @@ impl Gemma4TextModel {
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
             hidden_size_per_layer_input,
+            shared_kv_source,
         })
     }
 
@@ -687,20 +726,21 @@ impl Gemma4TextModel {
         ))
     }
 
-    pub fn forward(
+    fn forward_from_scaled_embeddings(
         &mut self,
         input_ids: &Tensor,
+        mut xs: Tensor,
         seqlen_offset: usize,
         sliding_window: usize,
     ) -> candle_core::Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
-        let inputs_embeds = self.embed_tokens.forward(input_ids)?;
-        let mut xs = (inputs_embeds * (self.hidden_size as f64).sqrt())?;
 
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
 
         let (full_attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset, sliding_window)?;
+
+        let mut produced_layer_kv: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let mask = if layer.is_sliding {
@@ -709,13 +749,24 @@ impl Gemma4TextModel {
                 &full_attention_mask
             };
 
+            let shared_kv = self.shared_kv_source[layer_idx]
+                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (k, v)));
+
             let per_layer_input = if let Some(ref all_inputs) = per_layer_inputs {
                 Some(all_inputs.narrow(2, layer_idx, 1)?.squeeze(2)?)
             } else {
                 None
             };
 
-            xs = layer.forward(&xs, per_layer_input.as_ref(), mask.as_ref(), seqlen_offset)?;
+            let (new_xs, produced_kv) = layer.forward(
+                &xs,
+                per_layer_input.as_ref(),
+                mask.as_ref(),
+                seqlen_offset,
+                shared_kv,
+            )?;
+            xs = new_xs;
+            produced_layer_kv[layer_idx] = produced_kv;
         }
 
         let logits = xs
@@ -725,8 +776,37 @@ impl Gemma4TextModel {
 
         match self.final_logit_softcapping {
             None => Ok(logits),
-            Some(sc) => ((logits / sc)?.tanh()? * sc),
+            Some(sc) => (logits / sc)?.tanh()? * sc,
         }
+    }
+
+    pub fn forward_with_inputs_embeds(
+        &mut self,
+        input_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        seqlen_offset: usize,
+        sliding_window: usize,
+    ) -> candle_core::Result<Tensor> {
+        let xs = (inputs_embeds * (self.hidden_size as f64).sqrt())?;
+        self.forward_from_scaled_embeddings(input_ids, xs, seqlen_offset, sliding_window)
+    }
+
+    pub fn embed_input_ids(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        sliding_window: usize,
+    ) -> candle_core::Result<Tensor> {
+        let inputs_embeds = self.embed_tokens.forward(input_ids)?;
+        self.forward_with_inputs_embeds(input_ids, &inputs_embeds, seqlen_offset, sliding_window)
     }
 
     pub fn clear_kv_cache(&mut self) {

@@ -7,10 +7,24 @@ use tokio::sync::mpsc;
 
 use super::stats::EngineStats;
 
+/// External multimodal payload associated with a generation request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultimodalInputs {
+    pub image_urls: Vec<String>,
+    pub audio_urls: Vec<String>,
+}
+
+impl MultimodalInputs {
+    pub fn is_empty(&self) -> bool {
+        self.image_urls.is_empty() && self.audio_urls.is_empty()
+    }
+}
+
 /// A request from an API handler to the engine.
 pub struct EngineRequest {
     pub id: String,
     pub tokens: Vec<u32>,
+    pub multimodal_inputs: MultimodalInputs,
     pub max_tokens: usize,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -56,11 +70,38 @@ impl EngineHandle {
         repetition_penalty: f32,
         eos_token_id: Vec<u32>,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
+        self.submit_with_multimodal(
+            id,
+            tokens,
+            MultimodalInputs::default(),
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            eos_token_id,
+        )
+    }
+
+    /// Submit a generation request with optional multimodal payload.
+    pub fn submit_with_multimodal(
+        &self,
+        id: String,
+        tokens: Vec<u32>,
+        multimodal_inputs: MultimodalInputs,
+        max_tokens: usize,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+        repetition_penalty: f32,
+        eos_token_id: Vec<u32>,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
                 id,
                 tokens,
+                multimodal_inputs,
                 max_tokens,
                 temperature,
                 top_p,
@@ -212,6 +253,7 @@ mod tests {
         let req = rx.recv().await.unwrap();
         assert_eq!(req.id, "req-42");
         assert_eq!(req.tokens, vec![10, 20, 30]);
+        assert!(req.multimodal_inputs.is_empty());
         assert_eq!(req.max_tokens, 100);
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.top_p, Some(0.9));

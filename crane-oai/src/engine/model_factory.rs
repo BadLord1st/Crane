@@ -6,6 +6,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::Path;
 
 use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
@@ -73,6 +74,101 @@ pub enum ModelFormat {
     Auto,
     Safetensors,
     Gguf,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCapabilities {
+    pub accepts_image_inputs: bool,
+    pub accepts_audio_inputs: bool,
+}
+
+fn value_has_any_key(v: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|k| v.get(*k).is_some())
+}
+
+fn detect_gemma4_capabilities(model_path: &str) -> ModelCapabilities {
+    let mut caps = ModelCapabilities::default();
+    let model_dir = if Path::new(model_path).is_file() {
+        Path::new(model_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(model_path).to_path_buf())
+    } else {
+        Path::new(model_path).to_path_buf()
+    };
+
+    let config_path = model_dir.join("config.json");
+    if let Ok(data) = std::fs::read(&config_path) {
+        if let Ok(cfg) = serde_json::from_slice::<Value>(&data) {
+            let top_image = value_has_any_key(
+                &cfg,
+                &[
+                    "vision_config",
+                    "image_config",
+                    "vision_tower",
+                    "vision_encoder",
+                    "mm_vision_tower",
+                ],
+            );
+            let top_audio = value_has_any_key(
+                &cfg,
+                &[
+                    "audio_config",
+                    "audio_tower",
+                    "audio_encoder",
+                    "speech_config",
+                ],
+            );
+            let nested = cfg.get("model_config").cloned().unwrap_or(Value::Null);
+            let nested_image = value_has_any_key(
+                &nested,
+                &[
+                    "vision_config",
+                    "image_config",
+                    "vision_tower",
+                    "vision_encoder",
+                    "mm_vision_tower",
+                ],
+            );
+            let nested_audio = value_has_any_key(
+                &nested,
+                &[
+                    "audio_config",
+                    "audio_tower",
+                    "audio_encoder",
+                    "speech_config",
+                ],
+            );
+            caps.accepts_image_inputs |= top_image || nested_image;
+            caps.accepts_audio_inputs |= top_audio || nested_audio;
+        }
+    }
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    if let Ok(data) = std::fs::read(&tokenizer_path) {
+        if let Ok(text) = String::from_utf8(data) {
+            let lower = text.to_lowercase();
+            caps.accepts_image_inputs |= lower.contains("<|image|>")
+                || lower.contains("<image>")
+                || lower.contains("image_token");
+            caps.accepts_audio_inputs |= lower.contains("<|audio|>")
+                || lower.contains("<audio>")
+                || lower.contains("audio_token");
+        }
+    }
+
+    caps
+}
+
+pub fn detect_model_capabilities(model_type: ModelType, model_path: &str) -> ModelCapabilities {
+    match model_type {
+        ModelType::PaddleOcrVl => ModelCapabilities {
+            accepts_image_inputs: true,
+            accepts_audio_inputs: false,
+        },
+        ModelType::Gemma4 => detect_gemma4_capabilities(model_path),
+        _ => ModelCapabilities::default(),
+    }
 }
 
 impl ModelFormat {

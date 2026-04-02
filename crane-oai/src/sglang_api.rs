@@ -165,6 +165,8 @@ pub struct ModelInfoResponse {
     pub model_path: String,
     pub model_type: String,
     pub is_generation: bool,
+    pub accepts_image_inputs: bool,
+    pub accepts_audio_inputs: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

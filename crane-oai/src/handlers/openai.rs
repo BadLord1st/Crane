@@ -19,12 +19,21 @@ use axum::{
     },
 };
 
-use crate::engine::EngineResponse;
+use crate::engine::{types::MultimodalInputs, EngineResponse};
 use crate::openai_api::*;
 use crate::{make_error, now_epoch, AppState};
+use tracing::warn;
 
 use super::sse;
 use super::vlm;
+
+fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
+    if matches!(state.output_mode, crate::gemma4_output::OutputMode::Gemma4) {
+        (Some(1.0), Some(0.95), Some(64))
+    } else {
+        (Some(0.8), Some(0.95), Some(40))
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Chat Completions
@@ -38,6 +47,16 @@ pub async fn chat_completions(
     // If VLM model is loaded, delegate to VLM handler.
     if state.vlm_tx.is_some() {
         return vlm::vlm_chat_completions(state, req).await;
+    }
+
+    if req.has_multimodal_inputs() {
+        let candidate_inputs = collect_multimodal_inputs(&req.messages);
+        validate_multimodal_inputs(&state, &candidate_inputs)?;
+        if matches!(state.output_mode, crate::gemma4_output::OutputMode::Gemma4) {
+            warn!(
+                "Gemma4 received multimodal content; using placeholder-only prompt path (vision/audio towers are not integrated in text backend yet)"
+            );
+        }
     }
 
     // Apply chat template.
@@ -62,6 +81,8 @@ pub async fn chat_completions(
         .as_ref()
         .map_or(false, |so| so.include_usage);
     let output_mode = state.output_mode;
+    let multimodal_inputs = collect_multimodal_inputs(&req.messages);
+    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
         make_error(
@@ -71,13 +92,14 @@ pub async fn chat_completions(
     })?;
 
     let response_rx = engine
-        .submit(
+        .submit_with_multimodal(
             request_id.clone(),
             input_ids,
+            multimodal_inputs,
             req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
+            req.temperature.or(default_temperature),
+            req.top_p.or(default_top_p),
+            req.top_k.or(default_top_k),
             req.repetition_penalty.unwrap_or(1.05),
             state.eos_token_id.clone(),
         )
@@ -146,6 +168,7 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let output_mode = state.output_mode;
+    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
         make_error(
@@ -159,9 +182,9 @@ pub async fn completions(
             request_id.clone(),
             input_ids,
             req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
+            req.temperature.or(default_temperature),
+            req.top_p.or(default_top_p),
+            req.top_k.or(default_top_k),
             req.repetition_penalty.unwrap_or(1.05),
             state.eos_token_id.clone(),
         )
@@ -298,6 +321,35 @@ pub async fn detokenize(
 // ─────────────────────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────────────────────
+
+fn collect_multimodal_inputs(messages: &[ChatMessage]) -> MultimodalInputs {
+    messages
+        .iter()
+        .fold(MultimodalInputs::default(), |mut acc, msg| {
+            acc.image_urls.extend(msg.image_urls());
+            acc.audio_urls.extend(msg.audio_urls());
+            acc
+        })
+}
+
+fn validate_multimodal_inputs(
+    state: &AppState,
+    inputs: &MultimodalInputs,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !inputs.image_urls.is_empty() && !state.accepts_image_inputs {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            "Loaded model does not support image inputs",
+        ));
+    }
+    if !inputs.audio_urls.is_empty() && !state.accepts_audio_inputs {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            "Loaded model does not support audio inputs",
+        ));
+    }
+    Ok(())
+}
 
 /// Collect all response chunks into (full_text, prompt_tokens, completion_tokens, finish_reason).
 async fn collect_response(

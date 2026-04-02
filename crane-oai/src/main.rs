@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
@@ -85,6 +85,20 @@ struct Args {
     /// until existing ones complete and free memory.
     #[arg(long)]
     gpu_memory_limit: Option<String>,
+
+    /// Safety profile for memory-heavy inference defaults.
+    /// auto: enable only on macOS when all memory/batch flags are left at defaults.
+    /// on: force safe defaults unless flags are explicitly set.
+    /// off: never auto-apply safety defaults.
+    #[arg(long, value_enum, default_value_t = SafeMode::Auto)]
+    safe_mode: SafeMode,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SafeMode {
+    Auto,
+    On,
+    Off,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -102,6 +116,10 @@ pub struct AppState {
     pub eos_token_id: Vec<u32>,
     /// Response post-processing mode for model-specific output cleanup.
     pub output_mode: OutputMode,
+    /// Whether loaded model accepts image inputs in prompt payloads.
+    pub accepts_image_inputs: bool,
+    /// Whether loaded model accepts audio inputs in prompt payloads.
+    pub accepts_audio_inputs: bool,
     /// Server start time (epoch seconds).
     pub server_start_time: u64,
     /// VLM model (PaddleOCR-VL) — present only for VLM model types.
@@ -164,7 +182,7 @@ pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorRespo
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     info!("Loading model from: {}", args.model_path);
 
@@ -197,7 +215,12 @@ async fn main() -> Result<()> {
         crane_core::models::DType::BF16
     };
     #[cfg(not(feature = "cuda"))]
-    let dtype = crane_core::models::DType::F32;
+    let dtype = if matches!(&device, crane_core::models::Device::Cpu) {
+        crane_core::models::DType::F32
+    } else {
+        // On Metal, bf16 is typically more numerically stable than f16 for LLM decoding.
+        crane_core::models::DType::BF16
+    };
 
     let device_name = format!("{:?}", device);
     let dtype_name = format!("{:?}", dtype);
@@ -218,6 +241,31 @@ async fn main() -> Result<()> {
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
+    let model_caps =
+        engine::model_factory::detect_model_capabilities(resolved_type, &args.model_path);
+
+    let using_default_batch = args.max_concurrent == 16 && args.decode_tokens_per_seq == 16;
+    let using_unbounded_ctx = args.max_seq_len == 0;
+    let using_unbounded_mem = args.gpu_memory_limit.is_none();
+    let using_default_limits = using_default_batch && using_unbounded_ctx && using_unbounded_mem;
+
+    let safe_mode_enabled = match args.safe_mode {
+        SafeMode::On => !args.cpu && using_default_limits,
+        SafeMode::Off => false,
+        SafeMode::Auto => cfg!(target_os = "macos") && !args.cpu && using_default_limits,
+    };
+
+    if safe_mode_enabled {
+        args.max_concurrent = 1;
+        args.decode_tokens_per_seq = 1;
+        args.max_seq_len = 1024;
+        args.gpu_memory_limit = Some("6G".to_string());
+        info!(
+            "Safety defaults enabled (safe_mode={:?}): max_concurrent=1, decode_tokens_per_seq=1, max_seq_len=1024, gpu_memory_limit=6G",
+            args.safe_mode
+        );
+        info!("Override by setting explicit memory/batch flags, or use --safe-mode off");
+    }
 
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
@@ -595,6 +643,8 @@ async fn main() -> Result<()> {
         } else {
             OutputMode::Plain
         },
+        accepts_image_inputs: model_caps.accepts_image_inputs,
+        accepts_audio_inputs: model_caps.accepts_audio_inputs,
         server_start_time: now_epoch(),
         vlm_tx: vlm_tx_opt,
         tts_tx: tts_tx_opt,
@@ -631,6 +681,10 @@ async fn main() -> Result<()> {
     println!(
         "  Device  : {}  │  dtype: {}",
         state.device_name, state.dtype_name
+    );
+    println!(
+        "  Inputs  : image={}  audio={}",
+        state.accepts_image_inputs, state.accepts_audio_inputs
     );
     if is_vlm {
         println!("  Mode    : VLM (vision-language model) — engine bypassed");

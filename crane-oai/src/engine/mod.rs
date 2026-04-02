@@ -653,6 +653,8 @@ impl InferenceEngine {
         info!(
             id = %req.id,
             prompt_len,
+            image_inputs = req.multimodal_inputs.image_urls.len(),
+            audio_inputs = req.multimodal_inputs.audio_urls.len(),
             max_tokens = effective_max_tokens,
             temp = ?req.temperature,
             top_p = ?req.top_p,
@@ -672,6 +674,7 @@ impl InferenceEngine {
             id: req.id.clone(),
             status: SequenceStatus::Waiting,
             tokens: req.tokens,
+            multimodal_inputs: req.multimodal_inputs,
             prompt_len,
             kv_caches: vec![None; self.num_layers],
             logits_processor: candle_transformers::generation::LogitsProcessor::new(
@@ -748,10 +751,18 @@ impl InferenceEngine {
             let seq = self.sequences.get(&seq_id).unwrap();
             (seq.next_input_ids().to_vec(), seq.start_pos())
         };
+        let multimodal_inputs = self
+            .sequences
+            .get(&seq_id)
+            .map(|seq| seq.multimodal_inputs.clone())
+            .unwrap_or_default();
 
         let prompt_len = input_ids.len();
 
-        let logits = match self.model.forward_step(&input_ids, start_pos) {
+        let logits = match self
+            .model
+            .forward_prefill(&input_ids, start_pos, &multimodal_inputs)
+        {
             Ok(l) => l,
             Err(e) => {
                 self.send_error(&seq_id, &format!("Prefill forward failed: {e}"));

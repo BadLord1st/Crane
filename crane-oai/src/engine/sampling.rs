@@ -36,11 +36,7 @@ impl SamplingBuffers {
         }
     }
 
-    pub fn get_topk_neg_vec(
-        &mut self,
-        k: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
+    pub fn get_topk_neg_vec(&mut self, k: usize, device: &Device) -> candle_core::Result<Tensor> {
         if let Some(t) = self.topk_neg_vecs.get(&k) {
             if t.device().same_device(device) {
                 return Ok(t.clone());
@@ -51,11 +47,7 @@ impl SamplingBuffers {
         Ok(t)
     }
 
-    pub fn get_topk_shift_idx(
-        &mut self,
-        k: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
+    pub fn get_topk_shift_idx(&mut self, k: usize, device: &Device) -> candle_core::Result<Tensor> {
         if let Some(t) = self.topk_shift_idxs.get(&k) {
             if t.device().same_device(device) {
                 return Ok(t.clone());
@@ -105,6 +97,28 @@ impl SamplingBuffers {
         self.topk_cumsum_mats.insert(k, t.clone());
         Ok(t)
     }
+}
+
+fn softmax_last_dim_fallback(xs: &Tensor) -> candle_core::Result<Tensor> {
+    let input_dtype = xs.dtype();
+    let compute_dtype = match input_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    };
+    let xs = xs.to_dtype(compute_dtype)?;
+    let max = xs.max_keepdim(candle_core::D::Minus1)?;
+    let exps = xs.broadcast_sub(&max)?.exp()?;
+    let den = exps.sum_keepdim(candle_core::D::Minus1)?;
+    exps.broadcast_div(&den)?.to_dtype(input_dtype)
+}
+
+fn sample_with_logits_processor(seq: &mut Sequence, logits: &Tensor) -> Result<u32> {
+    let sample_logits = if logits.device().is_cuda() {
+        logits.clone()
+    } else {
+        logits.to_device(&Device::Cpu)?
+    };
+    Ok(seq.logits_processor.sample(&sample_logits)?)
 }
 
 /// Sample a token from logits for a specific sequence.
@@ -174,13 +188,8 @@ pub fn sample(
             // Fall back to CPU LogitsProcessor which handles temperature +
             // top-p natively and only needs a ~600 KB DtoH copy.
             // Set CRANE_FORCE_GPU_TOPK=1 to override this heuristic.
-            if vocab > 65536
-                && std::env::var("CRANE_FORCE_GPU_TOPK")
-                    .ok()
-                    .as_deref()
-                    != Some("1")
-            {
-                let next_token = seq.logits_processor.sample(&logits)?;
+            if vocab > 65536 && std::env::var("CRANE_FORCE_GPU_TOPK").ok().as_deref() != Some("1") {
+                let next_token = sample_with_logits_processor(seq, &logits)?;
                 if trace {
                     let t_done = Instant::now();
                     debug!(
@@ -202,7 +211,8 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
-            let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
+            let topk_idx =
+                crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
 
@@ -236,7 +246,7 @@ pub fn sample(
 
             if top_p_active {
                 let scaled = (&topk_logits / temperature)?;
-                let probs = candle_nn::ops::softmax_last_dim(&scaled)?;
+                let probs = softmax_last_dim_fallback(&scaled)?;
                 let cumsum_mat = buffers.get_topk_cumsum_mat(top_k, logits.device())?;
                 let cumsum = probs
                     .reshape((1, top_k))?
@@ -244,8 +254,7 @@ pub fn sample(
                     .reshape(top_k)?;
                 let mask_le = cumsum.le(top_p)?;
 
-                let shift =
-                    buffers.get_topk_shift_buf(top_k, logits.device(), mask_le.dtype())?;
+                let shift = buffers.get_topk_shift_buf(top_k, logits.device(), mask_le.dtype())?;
                 shift.zero_set()?;
                 if top_k > 1 {
                     let idx = buffers.get_topk_shift_idx(top_k, logits.device())?;
@@ -280,7 +289,7 @@ pub fn sample(
         return Ok(idx.to_scalar::<u32>()?);
     }
 
-    let next_token = seq.logits_processor.sample(&logits)?;
+    let next_token = sample_with_logits_processor(seq, &logits)?;
     Ok(next_token)
 }
 

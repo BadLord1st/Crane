@@ -349,6 +349,7 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 | `--format` | `auto` | Weight format: `auto`, `safetensors`, `gguf` |
 | `--max-seq-len` | `0` | Max sequence length (prompt + generation); `0` = unlimited |
 | `--gpu-memory-limit` | *(none)* | VRAM cap: absolute (`5G`, `8G`, `5120M`) or fractional (`0.7` = 70% of total) |
+| `--safe-mode` | `auto` | Safety profile for memory defaults: `auto` (macOS only when limits are untouched), `on` (force safety defaults when limits are untouched), `off` (never auto-apply). |
 
 ### Parameter tuning guide
 
@@ -586,7 +587,7 @@ curl http://localhost:8000/generate \
 
 #### `GET /model_info`
 
-Returns model metadata including device (`Cuda(0)`, `Metal(0)`, `Cpu`).
+Returns model metadata including device (`Cuda(0)`, `Metal(0)`, `Cpu`) and input capability flags (`accepts_image_inputs`, `accepts_audio_inputs`).
 
 #### `GET /server_info`
 

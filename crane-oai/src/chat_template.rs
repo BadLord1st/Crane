@@ -7,7 +7,7 @@
 //!   `tokenizer_config.json` (works for Qwen, Llama, Mistral, …).
 //! * **[`HunyuanChatTemplate`]** — hardcoded template for Hunyuan models.
 
-use crate::openai_api::ChatMessage;
+use crate::openai_api::{ChatMessage, ChatMessageContent, ContentPart};
 use crane_core::autotokenizer::AutoTokenizer;
 
 // ─────────────────────────────────────────────────────────────
@@ -110,6 +110,37 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
 /// `<bos><|turn>{role}\n{content}<turn|>\n...<|turn>model\n`
 pub struct Gemma4ChatTemplate;
 
+fn render_gemma4_content(message: &ChatMessage) -> String {
+    const IMAGE_TOKEN: &str = "<|image|>";
+    const AUDIO_TOKEN: &str = "<|audio|>";
+
+    match &message.content {
+        ChatMessageContent::Text(s) => s.trim().to_string(),
+        ChatMessageContent::Parts(parts) => parts
+            .iter()
+            .fold(String::new(), |mut acc, part| {
+                match part {
+                    ContentPart::Text { text } => acc.push_str(text),
+                    ContentPart::ImageUrl { .. } | ContentPart::Image { .. } => {
+                        if !acc.is_empty() && !acc.ends_with('\n') {
+                            acc.push('\n');
+                        }
+                        acc.push_str(IMAGE_TOKEN);
+                    }
+                    ContentPart::AudioUrl { .. } => {
+                        if !acc.is_empty() && !acc.ends_with('\n') {
+                            acc.push('\n');
+                        }
+                        acc.push_str(AUDIO_TOKEN);
+                    }
+                }
+                acc
+            })
+            .trim()
+            .to_string(),
+    }
+}
+
 impl ChatTemplateProcessor for Gemma4ChatTemplate {
     fn apply(&self, messages: &[ChatMessage]) -> Result<String, String> {
         const BOS: &str = "<bos>";
@@ -128,13 +159,13 @@ impl ChatTemplateProcessor for Gemma4ChatTemplate {
                     "system" | "developer" => "system",
                     _ => return None,
                 };
-                Some((role, msg.text_content()))
+                Some((role, render_gemma4_content(msg)))
             })
             .for_each(|(role, content)| {
                 out.push_str(TURN_OPEN);
                 out.push_str(role);
                 out.push('\n');
-                out.push_str(content.trim());
+                out.push_str(&content);
                 out.push_str(TURN_CLOSE);
                 out.push('\n');
             });
@@ -150,8 +181,7 @@ impl ChatTemplateProcessor for Gemma4ChatTemplate {
 #[cfg(test)]
 mod tests {
     use super::{ChatTemplateProcessor, HunyuanChatTemplate};
-    use crate::openai_api::ChatMessage;
-    use crate::openai_api::ChatMessageContent;
+    use crate::openai_api::{AudioUrl, ChatMessage, ChatMessageContent, ContentPart, ImageUrl};
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
         pairs
@@ -238,5 +268,34 @@ mod tests {
         let proc: Box<dyn ChatTemplateProcessor> = Box::new(HunyuanChatTemplate);
         let msgs = make_messages(&[("user", "test")]);
         assert!(proc.apply(&msgs).is_ok());
+    }
+
+    #[test]
+    fn gemma4_renders_image_and_audio_placeholders() {
+        let tmpl = super::Gemma4ChatTemplate;
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: ChatMessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/a.png".to_string(),
+                    },
+                },
+                ContentPart::AudioUrl {
+                    audio_url: AudioUrl {
+                        url: "https://example.com/b.wav".to_string(),
+                    },
+                },
+            ]),
+        }];
+
+        let out = tmpl.apply(&msgs).unwrap();
+        assert!(out.contains("Describe this"));
+        assert!(out.contains("<|image|>"));
+        assert!(out.contains("<|audio|>"));
+        assert!(out.ends_with("<|turn>model\n"));
     }
 }
