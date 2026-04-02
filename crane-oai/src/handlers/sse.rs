@@ -7,9 +7,10 @@ use futures::stream::Stream;
 use tokio::sync::mpsc;
 
 use crate::engine::EngineResponse;
+use crate::gemma4_output::OutputMode;
+use crate::now_epoch;
 use crate::openai_api::*;
 use crate::sglang_api::*;
-use crate::now_epoch;
 
 // ─────────────────────────────────────────────────────────────
 //  Chat completions SSE
@@ -20,10 +21,13 @@ pub fn make_chat_sse_stream(
     model_name: String,
     mut rx: mpsc::UnboundedReceiver<EngineResponse>,
     include_usage: bool,
+    output_mode: OutputMode,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let created = now_epoch();
 
     async_stream::stream! {
+        let mut sanitizer = output_mode.stream_sanitizer();
+
         // Role announcement chunk.
         let first_chunk = ChatCompletionChunk {
             id: request_id.clone(),
@@ -48,6 +52,16 @@ pub fn make_chat_sse_stream(
         while let Some(resp) = rx.recv().await {
             match resp {
                 EngineResponse::Token { text, .. } => {
+                    let text = if let Some(s) = sanitizer.as_mut() {
+                        s.push_chunk(&text)
+                    } else {
+                        text
+                    };
+
+                    if text.is_empty() {
+                        continue;
+                    }
+
                     _completion_tokens += 1;
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
@@ -72,6 +86,28 @@ pub fn make_chat_sse_stream(
                     completion_tokens: ct,
                     ..
                 } => {
+                    if let Some(s) = sanitizer.as_mut() {
+                        let tail = s.finish();
+                        if !tail.is_empty() {
+                            let chunk = ChatCompletionChunk {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".into(),
+                                created,
+                                model: model_name.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: None,
+                                        content: Some(tail),
+                                    },
+                                    finish_reason: None,
+                                }],
+                                usage: None,
+                            };
+                            yield Ok(Event::default().json_data(&chunk).unwrap());
+                        }
+                    }
+
                     _prompt_tokens = pt;
                     _completion_tokens = ct;
 
@@ -129,16 +165,29 @@ pub fn make_completion_sse_stream(
     model_name: String,
     mut rx: mpsc::UnboundedReceiver<EngineResponse>,
     include_usage: bool,
+    output_mode: OutputMode,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let created = now_epoch();
 
     async_stream::stream! {
+        let mut sanitizer = output_mode.stream_sanitizer();
+
         let mut _prompt_tokens = 0usize;
         let mut _completion_tokens = 0usize;
 
         while let Some(resp) = rx.recv().await {
             match resp {
                 EngineResponse::Token { text, .. } => {
+                    let text = if let Some(s) = sanitizer.as_mut() {
+                        s.push_chunk(&text)
+                    } else {
+                        text
+                    };
+
+                    if text.is_empty() {
+                        continue;
+                    }
+
                     _completion_tokens += 1;
                     let chunk = CompletionChunk {
                         id: request_id.clone(),
@@ -160,6 +209,25 @@ pub fn make_completion_sse_stream(
                     completion_tokens: ct,
                     ..
                 } => {
+                    if let Some(s) = sanitizer.as_mut() {
+                        let tail = s.finish();
+                        if !tail.is_empty() {
+                            let chunk = CompletionChunk {
+                                id: request_id.clone(),
+                                object: "text_completion".into(),
+                                created,
+                                model: model_name.clone(),
+                                choices: vec![CompletionChunkChoice {
+                                    index: 0,
+                                    text: tail,
+                                    finish_reason: None,
+                                }],
+                                usage: None,
+                            };
+                            yield Ok(Event::default().json_data(&chunk).unwrap());
+                        }
+                    }
+
                     _prompt_tokens = pt;
                     _completion_tokens = ct;
 

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         sse::{KeepAlive, Sse},
@@ -41,10 +41,12 @@ pub async fn chat_completions(
     }
 
     // Apply chat template.
-    let formatted = state
-        .chat_template
-        .apply(&req.messages)
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?;
+    let formatted = state.chat_template.apply(&req.messages).map_err(|e| {
+        make_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Chat template failed: {e}"),
+        )
+    })?;
 
     // Tokenize.
     let input_ids = state
@@ -59,9 +61,13 @@ pub async fn chat_completions(
         .stream_options
         .as_ref()
         .map_or(false, |so| so.include_usage);
+    let output_mode = state.output_mode;
 
     let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+        make_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Text engine not available (VLM model loaded)",
+        )
     })?;
 
     let response_rx = engine
@@ -79,14 +85,19 @@ pub async fn chat_completions(
 
     if req.stream {
         let model_name = state.model_name.clone();
-        let stream =
-            sse::make_chat_sse_stream(request_id, model_name, response_rx, include_usage);
+        let stream = sse::make_chat_sse_stream(
+            request_id,
+            model_name,
+            response_rx,
+            include_usage,
+            output_mode,
+        );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         let (full_text, prompt_tokens, completion_tokens, finish_reason) =
-            collect_response(response_rx).await?;
+            collect_response(response_rx, output_mode).await?;
 
         let response = ChatCompletionResponse {
             id: request_id,
@@ -134,9 +145,13 @@ pub async fn completions(
         .to_vec();
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+    let output_mode = state.output_mode;
 
     let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+        make_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Text engine not available (VLM model loaded)",
+        )
     })?;
 
     let response_rx = engine
@@ -154,14 +169,19 @@ pub async fn completions(
 
     if req.stream {
         let model_name = state.model_name.clone();
-        let stream =
-            sse::make_completion_sse_stream(request_id, model_name, response_rx, include_usage);
+        let stream = sse::make_completion_sse_stream(
+            request_id,
+            model_name,
+            response_rx,
+            include_usage,
+            output_mode,
+        );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         let (full_text, prompt_tokens, completion_tokens, finish_reason) =
-            collect_response(response_rx).await?;
+            collect_response(response_rx, output_mode).await?;
 
         let response = CompletionResponse {
             id: request_id,
@@ -205,7 +225,10 @@ pub async fn retrieve_model(
     } else {
         Err(make_error(
             StatusCode::NOT_FOUND,
-            &format!("Model '{model_id}' not found. Available: {}", state.model_name),
+            &format!(
+                "Model '{model_id}' not found. Available: {}",
+                state.model_name
+            ),
         ))
     }
 }
@@ -233,10 +256,12 @@ pub async fn tokenize(
     // Determine the text to tokenize.
     let text = if let Some(messages) = &req.messages {
         // Apply chat template first.
-        state
-            .chat_template
-            .apply(messages)
-            .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?
+        state.chat_template.apply(messages).map_err(|e| {
+            make_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Chat template failed: {e}"),
+            )
+        })?
     } else if let Some(text) = &req.text {
         text.clone()
     } else {
@@ -277,6 +302,7 @@ pub async fn detokenize(
 /// Collect all response chunks into (full_text, prompt_tokens, completion_tokens, finish_reason).
 async fn collect_response(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<EngineResponse>,
+    output_mode: crate::gemma4_output::OutputMode,
 ) -> Result<(String, usize, usize, String), (StatusCode, Json<ErrorResponse>)> {
     let mut full_text = String::new();
     let mut prompt_tokens = 0usize;
@@ -305,6 +331,8 @@ async fn collect_response(
             }
         }
     }
+
+    full_text = output_mode.sanitize_text(&full_text);
 
     Ok((full_text, prompt_tokens, completion_tokens, finish_reason))
 }

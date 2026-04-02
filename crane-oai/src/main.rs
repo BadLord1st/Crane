@@ -1,5 +1,6 @@
 mod chat_template;
 mod engine;
+mod gemma4_output;
 mod handlers;
 mod openai_api;
 mod sglang_api;
@@ -21,6 +22,7 @@ use chat_template::ChatTemplateProcessor;
 use crane_core::models::paddleocr_vl::PaddleOcrVL;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use gemma4_output::OutputMode;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::VlmRequest;
 use openai_api::ErrorResponse;
@@ -98,6 +100,8 @@ pub struct AppState {
     pub chat_template: Box<dyn ChatTemplateProcessor>,
     /// Default EOS token ID(s) for this model.
     pub eos_token_id: Vec<u32>,
+    /// Response post-processing mode for model-specific output cleanup.
+    pub output_mode: OutputMode,
     /// Server start time (epoch seconds).
     pub server_start_time: u64,
     /// VLM model (PaddleOCR-VL) — present only for VLM model types.
@@ -586,6 +590,11 @@ async fn main() -> Result<()> {
         tokenizer,
         chat_template,
         eos_token_id,
+        output_mode: if matches!(resolved_type, ModelType::Gemma4) {
+            OutputMode::Gemma4
+        } else {
+            OutputMode::Plain
+        },
         server_start_time: now_epoch(),
         vlm_tx: vlm_tx_opt,
         tts_tx: tts_tx_opt,

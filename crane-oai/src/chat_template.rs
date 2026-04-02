@@ -84,8 +84,9 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
             result.push_str(SEP);
         }
 
-        for msg in loop_messages {
-            match msg.role.as_str() {
+        loop_messages
+            .iter()
+            .for_each(|msg| match msg.role.as_str() {
                 "user" => {
                     result.push_str(USER);
                     result.push_str(&msg.text_content());
@@ -96,8 +97,7 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
                     result.push_str(EOS);
                 }
                 _ => {}
-            }
-        }
+            });
 
         result.push_str(ASSISTANT);
         Ok(result)
@@ -119,21 +119,25 @@ impl ChatTemplateProcessor for Gemma4ChatTemplate {
         let mut out = String::new();
         out.push_str(BOS);
 
-        for msg in messages {
-            let role = match msg.role.as_str() {
-                "assistant" => "model",
-                "user" => "user",
-                "system" | "developer" => "system",
-                _ => continue,
-            };
-
-            out.push_str(TURN_OPEN);
-            out.push_str(role);
-            out.push('\n');
-            out.push_str(msg.text_content().trim());
-            out.push_str(TURN_CLOSE);
-            out.push('\n');
-        }
+        messages
+            .iter()
+            .filter_map(|msg| {
+                let role = match msg.role.as_str() {
+                    "assistant" => "model",
+                    "user" => "user",
+                    "system" | "developer" => "system",
+                    _ => return None,
+                };
+                Some((role, msg.text_content()))
+            })
+            .for_each(|(role, content)| {
+                out.push_str(TURN_OPEN);
+                out.push_str(role);
+                out.push('\n');
+                out.push_str(content.trim());
+                out.push_str(TURN_CLOSE);
+                out.push('\n');
+            });
 
         // Add generation prompt for assistant/model continuation.
         out.push_str(TURN_OPEN);
@@ -145,6 +149,8 @@ impl ChatTemplateProcessor for Gemma4ChatTemplate {
 
 #[cfg(test)]
 mod tests {
+    use super::{ChatTemplateProcessor, HunyuanChatTemplate};
+    use crate::openai_api::ChatMessage;
     use crate::openai_api::ChatMessageContent;
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
