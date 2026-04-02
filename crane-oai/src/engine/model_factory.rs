@@ -8,7 +8,7 @@ use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::backend::{HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
 // ─────────────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ pub enum ModelType {
     HunyuanDense,
     Qwen25,
     Qwen3,
+    Gemma4,
     Qwen3TTS,
     PaddleOcrVl,
 }
@@ -32,8 +33,11 @@ impl ModelType {
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
+            "gemma4" | "gemma-4" | "gemma_4" => Self::Gemma4,
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
-            "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
+            "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => {
+                Self::PaddleOcrVl
+            }
             _ => Self::Auto,
         }
     }
@@ -44,6 +48,7 @@ impl ModelType {
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
+            Self::Gemma4 => "gemma4",
             Self::Qwen3TTS => "qwen3_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
@@ -106,6 +111,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 // 1. Check `model_type` field
                 if let Some(ref mt) = config.model_type {
                     match mt.to_lowercase().as_str() {
+                        "gemma4" | "gemma4_text" | "gemma4_vision" | "gemma4_audio" => {
+                            return ModelType::Gemma4
+                        }
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
                         "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
@@ -124,6 +132,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         if a.contains("hunyuan") {
                             return ModelType::HunyuanDense;
+                        }
+                        if a.contains("gemma4") {
+                            return ModelType::Gemma4;
                         }
                         if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                             return ModelType::Qwen3TTS;
@@ -146,7 +157,12 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
-    } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
+    } else if path_lower.contains("gemma-4") || path_lower.contains("gemma4") {
+        ModelType::Gemma4
+    } else if path_lower.contains("qwen3-tts")
+        || path_lower.contains("qwen3_tts")
+        || path_lower.contains("qwen3tts")
+    {
         ModelType::Qwen3TTS
     } else if path_lower.contains("qwen3") {
         ModelType::Qwen3
@@ -187,19 +203,35 @@ pub fn create_backend(
     match model_type {
         ModelType::HunyuanDense => {
             let hy_fmt = match format {
-                ModelFormat::Safetensors => crane_core::models::hunyuan_dense::ModelFormat::Safetensors,
+                ModelFormat::Safetensors => {
+                    crane_core::models::hunyuan_dense::ModelFormat::Safetensors
+                }
                 ModelFormat::Gguf => crane_core::models::hunyuan_dense::ModelFormat::Gguf,
                 ModelFormat::Auto => crane_core::models::hunyuan_dense::ModelFormat::Auto,
             };
-            Ok(Box::new(HunyuanBackend::new(model_path, device, dtype, hy_fmt)?))
+            Ok(Box::new(HunyuanBackend::new(
+                model_path, device, dtype, hy_fmt,
+            )?))
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
+        ModelType::Gemma4 => match format {
+            ModelFormat::Gguf => {
+                anyhow::bail!("Gemma 4 GGUF is not supported yet. Use safetensors checkpoints.")
+            }
+            ModelFormat::Auto | ModelFormat::Safetensors => {
+                Ok(Box::new(Gemma4Backend::new(model_path, device, dtype)?))
+            }
+        },
         ModelType::PaddleOcrVl => {
-            anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
+            anyhow::bail!(
+                "PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()"
+            )
         }
         ModelType::Qwen3TTS => {
-            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
+            anyhow::bail!(
+                "Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()"
+            )
         }
         ModelType::Auto => unreachable!(),
     }
@@ -259,7 +291,10 @@ mod tests {
     #[test]
     fn model_type_from_str_hunyuan_variants() {
         assert_eq!(ModelType::from_str("hunyuan"), ModelType::HunyuanDense);
-        assert_eq!(ModelType::from_str("hunyuan_dense"), ModelType::HunyuanDense);
+        assert_eq!(
+            ModelType::from_str("hunyuan_dense"),
+            ModelType::HunyuanDense
+        );
         assert_eq!(ModelType::from_str("hunyuandense"), ModelType::HunyuanDense);
         assert_eq!(ModelType::from_str("HUNYUAN"), ModelType::HunyuanDense);
     }
@@ -272,6 +307,8 @@ mod tests {
         assert_eq!(ModelType::from_str("QWEN2"), ModelType::Qwen25);
         assert_eq!(ModelType::from_str("qwen3"), ModelType::Qwen3);
         assert_eq!(ModelType::from_str("QWEN3"), ModelType::Qwen3);
+        assert_eq!(ModelType::from_str("gemma4"), ModelType::Gemma4);
+        assert_eq!(ModelType::from_str("gemma-4"), ModelType::Gemma4);
     }
 
     #[test]
@@ -287,14 +324,21 @@ mod tests {
         assert_eq!(ModelType::HunyuanDense.display_name(), "hunyuan");
         assert_eq!(ModelType::Qwen25.display_name(), "qwen25");
         assert_eq!(ModelType::Qwen3.display_name(), "qwen3");
+        assert_eq!(ModelType::Gemma4.display_name(), "gemma4");
     }
 
     // ── ModelFormat::from_str ──
 
     #[test]
     fn model_format_from_str() {
-        assert_eq!(ModelFormat::from_str("safetensors"), ModelFormat::Safetensors);
-        assert_eq!(ModelFormat::from_str("SAFETENSORS"), ModelFormat::Safetensors);
+        assert_eq!(
+            ModelFormat::from_str("safetensors"),
+            ModelFormat::Safetensors
+        );
+        assert_eq!(
+            ModelFormat::from_str("SAFETENSORS"),
+            ModelFormat::Safetensors
+        );
         assert_eq!(ModelFormat::from_str("gguf"), ModelFormat::Gguf);
         assert_eq!(ModelFormat::from_str("auto"), ModelFormat::Auto);
         assert_eq!(ModelFormat::from_str("unknown"), ModelFormat::Auto);
@@ -321,14 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn detect_from_config_json_model_type_gemma4() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "gemma4"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Gemma4);
+    }
+
+    #[test]
     fn detect_from_config_json_architectures() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
-        std::fs::write(
-            &config,
-            r#"{"architectures": ["HunyuanForCausalLM"]}"#,
-        )
-        .unwrap();
+        std::fs::write(&config, r#"{"architectures": ["HunyuanForCausalLM"]}"#).unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::HunyuanDense);
     }
@@ -337,11 +386,7 @@ mod tests {
     fn detect_from_config_json_architectures_qwen2() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
-        std::fs::write(
-            &config,
-            r#"{"architectures": ["Qwen2ForCausalLM"]}"#,
-        )
-        .unwrap();
+        std::fs::write(&config, r#"{"architectures": ["Qwen2ForCausalLM"]}"#).unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen25);
     }
@@ -350,13 +395,22 @@ mod tests {
     fn detect_from_config_json_architectures_qwen3() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"architectures": ["Qwen3ForCausalLM"]}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_gemma4() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
         std::fs::write(
             &config,
-            r#"{"architectures": ["Qwen3ForCausalLM"]}"#,
+            r#"{"architectures": ["Gemma4ForConditionalGeneration"]}"#,
         )
         .unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
-        assert_eq!(result, ModelType::Qwen3);
+        assert_eq!(result, ModelType::Gemma4);
     }
 
     #[test]
@@ -375,6 +429,12 @@ mod tests {
     fn detect_path_heuristic_qwen2() {
         let result = detect_model_type("/models/Qwen2.5-7B-Instruct");
         assert_eq!(result, ModelType::Qwen25);
+    }
+
+    #[test]
+    fn detect_path_heuristic_gemma4() {
+        let result = detect_model_type("/models/gemma-4-E2B-it");
+        assert_eq!(result, ModelType::Gemma4);
     }
 
     #[test]

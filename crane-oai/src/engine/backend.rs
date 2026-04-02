@@ -74,7 +74,6 @@ pub trait ModelBackend: Send + 'static {
         0
     }
 
-
     // ── Batch decode (GPU-efficient concurrent serving) ───────
 
     /// Whether this backend supports batched decoding.
@@ -138,8 +137,9 @@ impl HunyuanBackend {
         dtype: &DType,
         format: crane_core::models::hunyuan_dense::ModelFormat,
     ) -> Result<Self> {
-        let model =
-            crane_core::models::hunyuan_dense::Model::new_with_format(model_path, device, dtype, format)?;
+        let model = crane_core::models::hunyuan_dense::Model::new_with_format(
+            model_path, device, dtype, format,
+        )?;
         Ok(Self { model })
     }
 }
@@ -218,8 +218,12 @@ impl ModelBackend for HunyuanBackend {
         attention_mask: Option<&Tensor>,
         batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
-        self.model
-            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+        self.model.step_batch_decode_with_input_ids(
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+        )
     }
 
     fn extract_batch_kv(
@@ -360,9 +364,16 @@ impl ModelBackend for Qwen3Backend {
         // Also include <|endoftext|> (151643) as a fallback.
         let tok = &self.model.tokenizer.tokenizer;
         let mut ids = Vec::new();
-        if let Some(id) = tok.token_to_id("<|im_end|>") { ids.push(id); }
-        if let Some(id) = tok.token_to_id("<|endoftext|>") { ids.push(id); }
-        if ids.is_empty() { ids.push(151645); ids.push(151643); }
+        if let Some(id) = tok.token_to_id("<|im_end|>") {
+            ids.push(id);
+        }
+        if let Some(id) = tok.token_to_id("<|endoftext|>") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(151645);
+            ids.push(151643);
+        }
         ids
     }
 
@@ -409,8 +420,12 @@ impl ModelBackend for Qwen3Backend {
         attention_mask: Option<&Tensor>,
         batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
-        self.model
-            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+        self.model.step_batch_decode_with_input_ids(
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+        )
     }
 
     fn extract_batch_kv(
@@ -436,5 +451,60 @@ impl ModelBackend for Qwen3Backend {
             self.device(),
             self.dtype(),
         )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Gemma 4 Backend (text-only)
+// ─────────────────────────────────────────────────────────────
+
+pub struct Gemma4Backend {
+    pub model: crane_core::models::gemma4::Model,
+}
+
+impl Gemma4Backend {
+    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+        let load_dtype = match device {
+            Device::Cpu => *dtype,
+            _ => DType::BF16,
+        };
+        let model = crane_core::models::gemma4::Model::new(model_path, device, &load_dtype)?;
+        Ok(Self { model })
+    }
+}
+
+impl ModelBackend for Gemma4Backend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.model
+            .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn num_layers(&self) -> usize {
+        0
+    }
+
+    fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.model.dtype
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.model.tokenizer.tokenizer
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        self.model.eos_token_ids.clone()
+    }
+
+    fn warmup(&mut self) {
+        self.model.warmup();
     }
 }

@@ -18,12 +18,12 @@ use clap::Parser;
 use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
+use crane_core::models::paddleocr_vl::PaddleOcrVL;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::VlmRequest;
 use openai_api::ErrorResponse;
-use crane_core::models::paddleocr_vl::PaddleOcrVL;
 
 // ═════════════════════════════════════════════════════════════
 //  CLI
@@ -39,7 +39,7 @@ struct Args {
     #[arg(long)]
     model_path: String,
 
-    /// Model architecture: auto, hunyuan, qwen25, qwen3, qwen3_tts, paddleocr_vl
+    /// Model architecture: auto, hunyuan, qwen25, qwen3, gemma4, qwen3_tts, paddleocr_vl
     #[arg(long, default_value = "auto")]
     model_type: String,
 
@@ -139,10 +139,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn make_error(
-    status: StatusCode,
-    msg: &str,
-) -> (StatusCode, Json<ErrorResponse>) {
+pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
         Json(ErrorResponse {
@@ -180,8 +177,7 @@ async fn main() -> Result<()> {
         {
             #[cfg(target_os = "macos")]
             {
-                crane_core::models::Device::new_metal(0)
-                    .unwrap_or(crane_core::models::Device::Cpu)
+                crane_core::models::Device::new_metal(0).unwrap_or(crane_core::models::Device::Cpu)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -221,17 +217,27 @@ async fn main() -> Result<()> {
 
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
-    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt):
-        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
+    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt): (
+        Option<EngineHandle>,
+        tokenizers::Tokenizer,
+        Vec<u32>,
+        Box<dyn ChatTemplateProcessor>,
+        Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
+    ) = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();
 
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
-            { !candle_core::utils::cuda_is_available() }
+            {
+                !candle_core::utils::cuda_is_available()
+            }
             #[cfg(not(feature = "cuda"))]
-            { true }
+            {
+                true
+            }
         };
 
         let tts_device = if use_cpu {
@@ -299,9 +305,7 @@ async fn main() -> Result<()> {
                             .map_err(|e| e.to_string())?
                             .flatten_all()
                             .map_err(|e| e.to_string())?;
-                        let samples = audio_f32
-                            .to_vec1::<f32>()
-                            .map_err(|e| e.to_string())?;
+                        let samples = audio_f32.to_vec1::<f32>().map_err(|e| e.to_string())?;
                         tracing::info!("TTS writing {} samples", samples.len());
 
                         match req.response_format {
@@ -366,26 +370,39 @@ async fn main() -> Result<()> {
         info!("TTS model routing established (type: {:?})", resolved_type);
 
         // Use tokenizer from the TTS model for API compatibility.
-        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let tokenizer =
+            crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
         let eos_id = tokenizer
             .token_to_id("<|im_end|>")
             .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
             .unwrap_or(151645);
 
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template =
+            engine::model_factory::create_chat_template(model_type, &args.model_path);
 
-        (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
+        (
+            None,
+            tokenizer,
+            vec![eos_id],
+            chat_template,
+            None,
+            Some(tts_tx),
+        )
     } else if is_vlm {
         // VLM path: create PaddleOcrVL on a dedicated thread to avoid Send/Sync issues.
         info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);
 
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
-            { !candle_core::utils::cuda_is_available() }
+            {
+                !candle_core::utils::cuda_is_available()
+            }
             #[cfg(not(feature = "cuda"))]
-            { true }
+            {
+                true
+            }
         };
 
         #[cfg(feature = "cuda")]
@@ -399,7 +416,11 @@ async fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("vlm-engine".into())
             .spawn(move || {
-                let mut vlm = match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
+                let mut vlm = match engine::model_factory::create_vlm_model(
+                    &model_path_clone,
+                    use_cpu,
+                    use_bf16,
+                ) {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::error!("Failed to load VLM model: {e}");
@@ -410,21 +431,32 @@ async fn main() -> Result<()> {
 
                 while let Some(req) = vlm_rx.blocking_recv() {
                     match req {
-                        VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
+                        VlmRequest::Recognize {
+                            img_path,
+                            task,
+                            max_tokens,
+                            tx,
+                        } => {
                             let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
                             if let Err(ref e) = res {
                                 tracing::error!("VLM Recognize failed: {:?}", e);
                             }
                             let _ = tx.send(res.map_err(|e| e.to_string()));
                         }
-                        VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
+                        VlmRequest::RecognizeStream {
+                            img_path,
+                            task,
+                            max_tokens,
+                            token_tx,
+                            done_tx,
+                        } => {
                             let res = vlm.recognize_stream(
                                 &img_path,
                                 task,
                                 max_tokens,
                                 |token_text: &str| {
                                     let _ = token_tx.send(token_text.to_string());
-                                }
+                                },
                             );
                             if let Err(ref e) = res {
                                 tracing::error!("VLM RecognizeStream failed: {:?}", e);
@@ -449,13 +481,25 @@ async fn main() -> Result<()> {
             .unwrap_or(2);
 
         // Chat template (uses Auto for jinja-based template).
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template =
+            engine::model_factory::create_chat_template(model_type, &args.model_path);
 
-        (None, tokenizer, vec![eos_id], chat_template, Some(vlm_tx), None)
+        (
+            None,
+            tokenizer,
+            vec![eos_id],
+            chat_template,
+            Some(vlm_tx),
+            None,
+        )
     } else {
         // Standard LLM path.
         let mut backend = engine::model_factory::create_backend(
-            model_type, &args.model_path, &device, &dtype, format,
+            model_type,
+            &args.model_path,
+            &device,
+            &dtype,
+            format,
         )?;
 
         info!(
@@ -470,26 +514,35 @@ async fn main() -> Result<()> {
         let tokenizer = backend.tokenizer().clone();
         let eos_token_id = backend.eos_token_id();
 
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template =
+            engine::model_factory::create_chat_template(model_type, &args.model_path);
 
         // ── Parse memory config ──
-        let mut memory_config = MemoryConfig::parse(
-            args.max_seq_len,
-            args.gpu_memory_limit.as_deref(),
-            &device,
-        );
+        let mut memory_config =
+            MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
         info!(
             "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
-            if memory_config.max_seq_len == 0 { "unlimited".to_string() } else { memory_config.max_seq_len.to_string() },
-            if memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(memory_config.gpu_memory_limit_bytes) },
+            if memory_config.max_seq_len == 0 {
+                "unlimited".to_string()
+            } else {
+                memory_config.max_seq_len.to_string()
+            },
+            if memory_config.gpu_memory_limit_bytes == 0 {
+                "unlimited".to_string()
+            } else {
+                format_bytes(memory_config.gpu_memory_limit_bytes)
+            },
             format_bytes(baseline_gpu),
         );
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(
-            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+            backend,
+            args.max_concurrent,
+            args.decode_tokens_per_seq,
+            memory_config,
         );
 
         std::thread::Builder::new()
@@ -501,7 +554,14 @@ async fn main() -> Result<()> {
             args.max_concurrent, args.decode_tokens_per_seq,
         );
 
-        (Some(handle), tokenizer, eos_token_id, chat_template, None, None)
+        (
+            Some(handle),
+            tokenizer,
+            eos_token_id,
+            chat_template,
+            None,
+            None,
+        )
     };
 
     // ── Model name for API responses ──
@@ -513,7 +573,10 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| resolved_type.display_name().to_string())
     });
 
-    let gpu_memory_limit_display = args.gpu_memory_limit.clone().unwrap_or_else(|| "unlimited".to_string());
+    let gpu_memory_limit_display = args
+        .gpu_memory_limit
+        .clone()
+        .unwrap_or_else(|| "unlimited".to_string());
 
     // ── Build router ──
 
@@ -546,13 +609,20 @@ async fn main() -> Result<()> {
 
     // ── Startup banner (printed after successful bind) ──
 
-    let sep  = "═".repeat(60);
+    let sep = "═".repeat(60);
     let sep2 = "─".repeat(60);
     println!("\n  {sep}");
     println!("  🚀  crane-oai  v{}  ready", env!("CARGO_PKG_VERSION"));
     println!("  {sep}");
-    println!("  Model   : {} ({})", model_name, resolved_type.display_name());
-    println!("  Device  : {}  │  dtype: {}", state.device_name, state.dtype_name);
+    println!(
+        "  Model   : {} ({})",
+        model_name,
+        resolved_type.display_name()
+    );
+    println!(
+        "  Device  : {}  │  dtype: {}",
+        state.device_name, state.dtype_name
+    );
     if is_vlm {
         println!("  Mode    : VLM (vision-language model) — engine bypassed");
     } else if is_tts {
@@ -561,11 +631,18 @@ async fn main() -> Result<()> {
     println!("  Listen  : http://{local_addr}");
     if !is_vlm {
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
-            let seq_str = if args.max_seq_len == 0 { "unlimited".to_string() } else { args.max_seq_len.to_string() };
+            let seq_str = if args.max_seq_len == 0 {
+                "unlimited".to_string()
+            } else {
+                args.max_seq_len.to_string()
+            };
             let mem_str = state.gpu_memory_limit.clone();
             println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
         }
-        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
+        println!(
+            "  Batch   : max_concurrent={}  decode_tokens_per_seq={}",
+            args.max_concurrent, args.decode_tokens_per_seq
+        );
     }
     println!("  {sep2}");
     println!("  OpenAI-compatible API");
@@ -601,11 +678,17 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handlers::common::health))
         .route("/v1/stats", get(handlers::common::stats))
         // ── OpenAI-compatible ──
-        .route("/v1/chat/completions", post(handlers::openai::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(handlers::openai::chat_completions),
+        )
         .route("/v1/completions", post(handlers::openai::completions))
         .route("/v1/audio/speech", post(handlers::tts::speech))
         .route("/v1/models", get(handlers::openai::list_models))
-        .route("/v1/models/{model_id}", get(handlers::openai::retrieve_model))
+        .route(
+            "/v1/models/{model_id}",
+            get(handlers::openai::retrieve_model),
+        )
         .route("/v1/tokenize", post(handlers::openai::tokenize))
         .route("/v1/detokenize", post(handlers::openai::detokenize))
         // ── Convenience aliases (SGLang-style) ──
@@ -616,7 +699,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/model_info", get(handlers::sglang::model_info))
         .route("/server_info", get(handlers::sglang::server_info))
         .route("/health_generate", get(handlers::sglang::health_generate))
-        .route("/flush_cache", get(handlers::sglang::flush_cache).post(handlers::sglang::flush_cache))
+        .route(
+            "/flush_cache",
+            get(handlers::sglang::flush_cache).post(handlers::sglang::flush_cache),
+        )
         .route("/abort_request", post(handlers::sglang::abort_request))
         .with_state(state)
 }

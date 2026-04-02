@@ -355,7 +355,6 @@ pub struct SpeechRequest {
     pub max_tokens: usize,
 
     // ── Voice-clone fields (Base model only) ──────────────────
-
     /// URL or local path to reference audio for voice cloning.
     /// When set, triggers voice-clone mode (requires Base model).
     #[serde(default)]

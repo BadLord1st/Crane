@@ -1,3 +1,4 @@
+pub mod gemma4;
 pub mod modules;
 #[cfg(feature = "onnx")]
 pub mod moonshine_asr;
