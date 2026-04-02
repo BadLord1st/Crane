@@ -176,10 +176,7 @@ mod tests {
     #[test]
     fn hunyuan_system_message_prepended() {
         let tmpl = HunyuanChatTemplate;
-        let msgs = make_messages(&[
-            ("system", "You are helpful"),
-            ("user", "Hi"),
-        ]);
+        let msgs = make_messages(&[("system", "You are helpful"), ("user", "Hi")]);
         let result = tmpl.apply(&msgs).unwrap();
 
         // System content should appear after BOS followed by SEP.
