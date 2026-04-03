@@ -35,6 +35,17 @@ fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Op
     }
 }
 
+fn effective_include_reasoning(
+    output_mode: crate::gemma4_output::OutputMode,
+    requested: bool,
+) -> bool {
+    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) {
+        true
+    } else {
+        requested
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Chat Completions
 // ─────────────────────────────────────────────────────────────
@@ -80,8 +91,11 @@ pub async fn chat_completions(
         .stream_options
         .as_ref()
         .map_or(false, |so| so.include_usage);
-    let include_reasoning = req.include_reasoning;
     let output_mode = state.output_mode;
+    let include_reasoning = effective_include_reasoning(output_mode, req.include_reasoning);
+    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) && !req.include_reasoning {
+        warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
+    }
     let multimodal_inputs = collect_multimodal_inputs(&req.messages);
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
 
@@ -170,7 +184,10 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let output_mode = state.output_mode;
-    let include_reasoning = req.include_reasoning;
+    let include_reasoning = effective_include_reasoning(output_mode, req.include_reasoning);
+    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) && !req.include_reasoning {
+        warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
+    }
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
