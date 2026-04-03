@@ -10,6 +10,10 @@ use serde_json::Value;
 use std::path::Path;
 
 use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::runtime::{
+    BackendRuntimeShim, ChatFormatStrategy, ModelCapabilities as RuntimeCapabilities, ModelSpec,
+    OutputStrategy, RuntimeModel, SamplingDefaults,
+};
 use crate::chat_template::{
     AutoChatTemplate, ChatTemplateProcessor, Gemma4ChatTemplate, HunyuanChatTemplate,
 };
@@ -168,6 +172,70 @@ pub fn detect_model_capabilities(model_type: ModelType, model_path: &str) -> Mod
         },
         ModelType::Gemma4 => detect_gemma4_capabilities(model_path),
         _ => ModelCapabilities::default(),
+    }
+}
+
+pub fn create_model_spec(model_type: ModelType, model_path: &str) -> ModelSpec {
+    let resolved = resolve(model_type, model_path);
+    let base_caps = detect_model_capabilities(resolved, model_path);
+
+    let mut capabilities = RuntimeCapabilities {
+        text: !resolved.is_vlm() && !resolved.is_tts(),
+        multimodal: base_caps.accepts_image_inputs || base_caps.accepts_audio_inputs,
+        tool_call_tokens: matches!(resolved, ModelType::Gemma4),
+        batch_decode: matches!(resolved, ModelType::HunyuanDense | ModelType::Qwen3),
+        kv_swap: matches!(resolved, ModelType::HunyuanDense | ModelType::Qwen3),
+        accepts_image_inputs: base_caps.accepts_image_inputs,
+        accepts_audio_inputs: base_caps.accepts_audio_inputs,
+    };
+
+    let (chat_format_strategy, output_strategy, sampling_defaults) = match resolved {
+        ModelType::HunyuanDense => (
+            ChatFormatStrategy::Hunyuan,
+            OutputStrategy::Plain,
+            SamplingDefaults::default(),
+        ),
+        ModelType::Gemma4 => (
+            ChatFormatStrategy::Gemma4,
+            OutputStrategy::Gemma4,
+            SamplingDefaults {
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(64),
+            },
+        ),
+        ModelType::Qwen3 => (
+            ChatFormatStrategy::AutoJinja,
+            OutputStrategy::Plain,
+            SamplingDefaults {
+                temperature: Some(0.8),
+                top_p: Some(0.95),
+                top_k: Some(20),
+            },
+        ),
+        ModelType::Qwen25 => (
+            ChatFormatStrategy::AutoJinja,
+            OutputStrategy::Plain,
+            SamplingDefaults::default(),
+        ),
+        ModelType::Qwen3TTS | ModelType::PaddleOcrVl | ModelType::Auto => (
+            ChatFormatStrategy::AutoJinja,
+            OutputStrategy::Plain,
+            SamplingDefaults::default(),
+        ),
+    };
+
+    if resolved.is_vlm() || resolved.is_tts() {
+        capabilities.batch_decode = false;
+        capabilities.kv_swap = false;
+    }
+
+    ModelSpec {
+        capabilities,
+        chat_format_strategy,
+        output_strategy,
+        sampling_defaults,
+        limits: Default::default(),
     }
 }
 
@@ -335,23 +403,41 @@ pub fn create_backend(
     }
 }
 
+pub fn create_runtime_model(
+    model_type: ModelType,
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+    format: ModelFormat,
+) -> Result<Box<dyn RuntimeModel>> {
+    let backend = create_backend(model_type, model_path, device, dtype, format)?;
+    let shim = BackendRuntimeShim::new(backend);
+    Ok(Box::new(shim))
+}
+
 /// Create a chat template processor for the given model.
 pub fn create_chat_template(
     model_type: ModelType,
     model_path: &str,
 ) -> Box<dyn ChatTemplateProcessor> {
-    let model_type = resolve(model_type, model_path);
+    let spec = create_model_spec(model_type, model_path);
+    create_chat_template_from_spec(&spec, model_path)
+}
 
-    match model_type {
-        ModelType::HunyuanDense => {
+pub fn create_chat_template_from_spec(
+    spec: &ModelSpec,
+    model_path: &str,
+) -> Box<dyn ChatTemplateProcessor> {
+    match spec.chat_format_strategy {
+        ChatFormatStrategy::Hunyuan => {
             // Prefer jinja template from tokenizer_config.json if available.
             match AutoChatTemplate::new(model_path) {
                 Ok(t) => Box::new(t),
                 Err(_) => Box::new(HunyuanChatTemplate),
             }
         }
-        ModelType::Gemma4 => Box::new(Gemma4ChatTemplate),
-        _ => match AutoChatTemplate::new(model_path) {
+        ChatFormatStrategy::Gemma4 => Box::new(Gemma4ChatTemplate),
+        ChatFormatStrategy::AutoJinja => match AutoChatTemplate::new(model_path) {
             Ok(t) => Box::new(t),
             Err(e) => {
                 tracing::warn!("Failed to load chat template: {e}; using Hunyuan fallback");

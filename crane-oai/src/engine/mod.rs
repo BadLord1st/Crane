@@ -28,7 +28,10 @@
 //! | `model_factory` | Auto-detection and factory creation               |
 
 pub mod backend;
+pub mod adapters;
 pub mod model_factory;
+pub mod policies;
+pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
 pub mod sequence;
@@ -48,8 +51,8 @@ use candle_core::{Device, Tensor};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use backend::ModelBackend;
 use crane_core::utils::token_output_stream::TokenOutputStream;
+use runtime::{BatchDecodeContext, RuntimeModel, RuntimeRequestContext, RuntimeStepContext};
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -199,7 +202,7 @@ const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
 /// Runs on a dedicated OS thread (model forward passes are synchronous).
 /// Communicates with async API handlers via channels.
 pub struct InferenceEngine {
-    model: Box<dyn ModelBackend>,
+    model: Box<dyn RuntimeModel>,
     sequences: HashMap<String, Sequence>,
     token_streams: HashMap<String, TokenOutputStream>,
     scheduler: Scheduler,
@@ -231,7 +234,7 @@ pub struct InferenceEngine {
 impl InferenceEngine {
     /// Create the engine and return a handle for submitting requests.
     pub fn new(
-        model: Box<dyn ModelBackend>,
+        model: Box<dyn RuntimeModel>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
         memory_config: MemoryConfig,
@@ -430,13 +433,13 @@ impl InferenceEngine {
     // ─────────────────────────────────────────────────────────
 
     /// Recount `tracked_kv_bytes` from all sequences.
-    /// For the active sequence, bytes are in the model (uses `active_kv_cache_bytes`).
+    /// For the active sequence, bytes are in the model (uses runtime `kv_bytes`).
     /// For other sequences, bytes are stored in `seq.kv_caches`.
     fn recount_kv_bytes(&mut self) {
         let mut total: u64 = 0;
         for (id, seq) in &self.sequences {
             if self.active_seq_id.as_deref() == Some(id.as_str()) {
-                total += self.model.active_kv_cache_bytes();
+                total += self.model.kv_bytes();
             } else {
                 total += sequence::kv_cache_bytes(&seq.kv_caches);
             }
@@ -764,11 +767,12 @@ impl InferenceEngine {
 
         let prompt_len = input_ids.len();
 
-        let logits = match self
-            .model
-            .forward_prefill(&input_ids, start_pos, &multimodal_inputs)
-        {
-            Ok(l) => l,
+        let logits = match self.model.prefill(RuntimeRequestContext {
+            input_ids,
+            start_pos,
+            multimodal_inputs,
+        }) {
+            Ok(step) => step.logits,
             Err(e) => {
                 self.send_error(&seq_id, &format!("Prefill forward failed: {e}"));
                 return;
@@ -864,7 +868,7 @@ impl InferenceEngine {
         // Flush model's internal KV cache state.
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
-                let caches = self.model.get_kv_caches();
+                let caches = self.model.kv_extract();
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
                     seq.kv_caches = caches;
                 }
@@ -978,12 +982,12 @@ impl InferenceEngine {
                 None => None,
             };
 
-            let logits = match self.model.step_batch_decode(
-                &input_ids,
-                &positions,
-                mask_for_round.as_ref(),
-                Some((&kv_lens, original_max_kv)),
-            ) {
+            let logits = match self.model.batch_decode(BatchDecodeContext {
+                input_ids: &input_ids,
+                positions: &positions,
+                attention_mask: mask_for_round.as_ref(),
+                batch_kv_info: Some((&kv_lens, original_max_kv)),
+            }) {
                 Ok(l) => l,
                 Err(e) => {
                     error!("Batched decode forward failed (round {round}): {e}");
@@ -1153,8 +1157,11 @@ impl InferenceEngine {
                     (seq.next_input_ids().to_vec(), seq.start_pos())
                 };
 
-                let logits = match self.model.forward_step(&input_ids, start_pos) {
-                    Ok(l) => l,
+                let logits = match self.model.decode(RuntimeStepContext {
+                    input_ids,
+                    start_pos,
+                }) {
+                    Ok(step) => step.logits,
                     Err(e) => {
                         self.send_error(seq_id, &format!("Decode forward failed: {e}"));
                         break;
@@ -1247,7 +1254,7 @@ impl InferenceEngine {
 
         // Save previous active sequence's KV cache from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
-            let caches = self.model.get_kv_caches();
+            let caches = self.model.kv_extract();
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
                 prev_seq.kv_caches = caches;
             }
@@ -1259,7 +1266,7 @@ impl InferenceEngine {
             .get(seq_id)
             .map(|s| s.kv_caches.clone())
             .unwrap_or_else(|| vec![None; self.num_layers]);
-        self.model.set_kv_caches(caches);
+        self.model.kv_restore(caches);
         self.active_seq_id = Some(seq_id.to_string());
 
         self.recount_kv_bytes();
@@ -1386,7 +1393,7 @@ impl InferenceEngine {
         // Subtract this sequence's KV bytes from the tracked total.
         // If active, bytes are in the model (not in seq.kv_caches).
         let freed = if self.active_seq_id.as_deref() == Some(seq_id) {
-            self.model.active_kv_cache_bytes()
+            self.model.kv_bytes()
         } else if let Some(seq) = self.sequences.get(seq_id) {
             sequence::kv_cache_bytes(&seq.kv_caches)
         } else {

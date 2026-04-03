@@ -38,22 +38,18 @@ use super::sse;
 use super::vlm;
 
 fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
-    if matches!(state.output_mode, crate::gemma4_output::OutputMode::Gemma4) {
-        (Some(1.0), Some(0.95), Some(64))
-    } else {
-        (Some(0.8), Some(0.95), Some(40))
-    }
+    let d = state.model_spec.sampling_defaults;
+    (d.temperature, d.top_p, d.top_k)
 }
 
 fn effective_include_reasoning(
-    output_mode: crate::gemma4_output::OutputMode,
+    state: &AppState,
     requested: bool,
 ) -> bool {
-    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) {
-        true
-    } else {
-        requested
-    }
+    crate::engine::policies::output_policy::effective_include_reasoning(
+        state.model_spec.output_strategy,
+        requested,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -86,8 +82,8 @@ pub async fn chat_completions(
         .as_ref()
         .is_some_and(|so| so.include_usage);
     let output_mode = state.output_mode;
-    let include_reasoning = effective_include_reasoning(output_mode, req.include_reasoning);
-    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) && !req.include_reasoning {
+    let include_reasoning = effective_include_reasoning(&state, req.include_reasoning);
+    if include_reasoning && !req.include_reasoning {
         warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
     }
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
@@ -616,8 +612,8 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let output_mode = state.output_mode;
-    let include_reasoning = effective_include_reasoning(output_mode, req.include_reasoning);
-    if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) && !req.include_reasoning {
+    let include_reasoning = effective_include_reasoning(&state, req.include_reasoning);
+    if include_reasoning && !req.include_reasoning {
         warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
     }
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
@@ -854,7 +850,7 @@ async fn collect_response_details(
     // channel. If reasoning is hidden and the visible answer looks unusable,
     // fall back to including reasoning text instead of returning garbage.
     if !include_reasoning
-        && matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4)
+        && output_mode == crate::gemma4_output::OutputMode::Gemma4
         && looks_unusable_answer(&sanitized)
     {
         sanitized = output_mode.sanitize_text(&full_text, true);

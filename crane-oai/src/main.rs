@@ -20,6 +20,7 @@ use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
+use engine::runtime::ModelSpec;
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use gemma4_output::OutputMode;
 use handlers::tts::TtsGenerateRequest;
@@ -107,6 +108,7 @@ enum SafeMode {
 pub struct AppState {
     pub engine: Option<EngineHandle>,
     pub model_name: String,
+    pub model_spec: ModelSpec,
     /// Shared tokenizer for request pre-processing.
     pub tokenizer: tokenizers::Tokenizer,
     /// Chat template processor (model-specific).
@@ -251,8 +253,7 @@ async fn main() -> Result<()> {
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
-    let model_caps =
-        engine::model_factory::detect_model_capabilities(resolved_type, &args.model_path);
+    let model_spec = engine::model_factory::create_model_spec(resolved_type, &args.model_path);
 
     let using_default_batch = args.max_concurrent == 16 && args.decode_tokens_per_seq == 16;
     let using_unbounded_ctx = args.max_seq_len == 0;
@@ -436,7 +437,7 @@ async fn main() -> Result<()> {
             .unwrap_or(151645);
 
         let chat_template =
-            engine::model_factory::create_chat_template(model_type, &args.model_path);
+            engine::model_factory::create_chat_template_from_spec(&model_spec, &args.model_path);
 
         (
             None,
@@ -538,7 +539,7 @@ async fn main() -> Result<()> {
 
         // Chat template (uses Auto for jinja-based template).
         let chat_template =
-            engine::model_factory::create_chat_template(model_type, &args.model_path);
+            engine::model_factory::create_chat_template_from_spec(&model_spec, &args.model_path);
 
         (
             None,
@@ -550,7 +551,7 @@ async fn main() -> Result<()> {
         )
     } else {
         // Standard LLM path.
-        let mut backend = engine::model_factory::create_backend(
+        let mut backend = engine::model_factory::create_runtime_model(
             model_type,
             &args.model_path,
             &device,
@@ -571,7 +572,7 @@ async fn main() -> Result<()> {
         let eos_token_id = backend.eos_token_id();
 
         let chat_template =
-            engine::model_factory::create_chat_template(model_type, &args.model_path);
+            engine::model_factory::create_chat_template_from_spec(&model_spec, &args.model_path);
 
         // ── Parse memory config ──
         let mut memory_config =
@@ -633,22 +634,22 @@ async fn main() -> Result<()> {
         .gpu_memory_limit
         .clone()
         .unwrap_or_else(|| "unlimited".to_string());
+    let output_mode = engine::policies::output_policy::output_mode(model_spec.output_strategy);
+    let accepts_image_inputs = model_spec.capabilities.accepts_image_inputs;
+    let accepts_audio_inputs = model_spec.capabilities.accepts_audio_inputs;
 
     // ── Build router ──
 
     let state = Arc::new(AppState {
         engine: engine_handle,
         model_name: model_name.clone(),
+        model_spec,
         tokenizer,
         chat_template,
         eos_token_id,
-        output_mode: if matches!(resolved_type, ModelType::Gemma4) {
-            OutputMode::Gemma4
-        } else {
-            OutputMode::Plain
-        },
-        accepts_image_inputs: model_caps.accepts_image_inputs,
-        accepts_audio_inputs: model_caps.accepts_audio_inputs,
+        output_mode,
+        accepts_image_inputs,
+        accepts_audio_inputs,
         server_start_time: now_epoch(),
         vlm_tx: vlm_tx_opt,
         tts_tx: tts_tx_opt,

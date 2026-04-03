@@ -29,11 +29,8 @@ use super::sse;
 use super::vlm;
 
 fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
-    if state.model_type_name.eq_ignore_ascii_case("gemma4") {
-        (Some(1.0), Some(0.95), Some(64))
-    } else {
-        (Some(0.8), Some(0.95), Some(20))
-    }
+    let d = state.model_spec.sampling_defaults;
+    (d.temperature, d.top_p, d.top_k)
 }
 
 // ─────────────────────────────────────────────────────────────
