@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::sequence::Sequence;
 
@@ -121,6 +121,39 @@ fn sample_with_logits_processor(seq: &mut Sequence, logits: &Tensor) -> Result<u
     Ok(seq.logits_processor.sample(&sample_logits)?)
 }
 
+enum GpuTopkPlan {
+    UseGpu { top_k: usize },
+    UseCpu,
+}
+
+fn max_gpu_topk_by_shared_mem() -> usize {
+    // Matches the launch config in crane-core/src/fused_ops/cuda_impl.rs:
+    // shared = block_dim(128) * k * (sizeof(f32) + sizeof(u32)).
+    // Without an explicit opt-in for larger dynamic shared memory, CUDA
+    // kernels are limited to 48 KiB dynamic shared memory per block.
+    const DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES: usize = 48 * 1024;
+    const TOPK_BLOCK_DIM: usize = 128;
+    const BYTES_PER_TOPK_ENTRY: usize = std::mem::size_of::<f32>() + std::mem::size_of::<u32>();
+    (DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES / (TOPK_BLOCK_DIM * BYTES_PER_TOPK_ENTRY)).clamp(8, 64)
+}
+
+fn build_gpu_topk_plan(seq: &Sequence, vocab: usize, top_p_active: bool) -> GpuTopkPlan {
+    let mut top_k = seq.top_k.unwrap_or(0);
+    if top_k == 0 && top_p_active {
+        top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+    }
+
+    let top_k = top_k.min(max_gpu_topk_by_shared_mem()).min(vocab);
+    if top_k > 0 && top_k < vocab {
+        GpuTopkPlan::UseGpu { top_k }
+    } else {
+        GpuTopkPlan::UseCpu
+    }
+}
+
 /// Sample a token from logits for a specific sequence.
 ///
 /// Supports:
@@ -181,8 +214,7 @@ pub fn sample(
         let vocab = logits.dim(0)?;
         let temperature = seq.temperature.unwrap_or(1.0);
 
-        let mut top_k = seq.top_k.unwrap_or(0);
-        if top_k == 0 && top_p_active {
+        if seq.top_k.unwrap_or(0) == 0 && top_p_active {
             // For large vocabularies (>64 K tokens) where top_k was NOT
             // explicitly requested, avoid the expensive GPU topk kernel.
             // Fall back to CPU LogitsProcessor which handles temperature +
@@ -203,16 +235,25 @@ pub fn sample(
                 }
                 return Ok(next_token);
             }
-            top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(64);
         }
-        top_k = top_k.min(64).min(vocab);
 
-        if top_k > 0 && top_k < vocab {
-            let topk_idx =
-                crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
+        if let GpuTopkPlan::UseGpu { top_k } = build_gpu_topk_plan(seq, vocab, top_p_active) {
+            let topk_idx = match crane_core::fused_ops::topk_indices(&logits, top_k) {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("CUDA_ERROR_INVALID_VALUE") {
+                        warn!(
+                            id = %seq_id,
+                            top_k,
+                            err = %msg,
+                            "gpu top-k failed; using CPU fallback"
+                        );
+                        return sample_with_logits_processor(seq, &logits);
+                    }
+                    return Err(anyhow::Error::from(e));
+                }
+            };
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
 
