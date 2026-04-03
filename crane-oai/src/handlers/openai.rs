@@ -389,7 +389,40 @@ async fn collect_response(
         }
     }
 
-    full_text = output_mode.sanitize_text(&full_text, include_reasoning);
+    let mut sanitized = output_mode.sanitize_text(&full_text, include_reasoning);
+
+    // Gemma4 base models may place almost all useful content in the reasoning
+    // channel. If reasoning is hidden and the visible answer looks unusable,
+    // fall back to including reasoning text instead of returning garbage.
+    if !include_reasoning
+        && matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4)
+        && looks_unusable_answer(&sanitized)
+    {
+        sanitized = output_mode.sanitize_text(&full_text, true);
+    }
+
+    full_text = sanitized;
 
     Ok((full_text, prompt_tokens, completion_tokens, finish_reason))
+}
+
+fn looks_unusable_answer(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+
+    let alpha = t.chars().filter(|c| c.is_alphabetic()).count();
+    let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+
+    if alpha == 0 {
+        return true;
+    }
+    if t.len() < 16 && alpha < 4 {
+        return true;
+    }
+    if digits > 0 && alpha.saturating_mul(3) < digits {
+        return true;
+    }
+    false
 }
