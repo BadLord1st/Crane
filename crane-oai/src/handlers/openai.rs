@@ -80,6 +80,7 @@ pub async fn chat_completions(
         .stream_options
         .as_ref()
         .map_or(false, |so| so.include_usage);
+    let include_reasoning = req.include_reasoning;
     let output_mode = state.output_mode;
     let multimodal_inputs = collect_multimodal_inputs(&req.messages);
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
@@ -113,13 +114,14 @@ pub async fn chat_completions(
             response_rx,
             include_usage,
             output_mode,
+            include_reasoning,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         let (full_text, prompt_tokens, completion_tokens, finish_reason) =
-            collect_response(response_rx, output_mode).await?;
+            collect_response(response_rx, output_mode, include_reasoning).await?;
 
         let response = ChatCompletionResponse {
             id: request_id,
@@ -168,6 +170,7 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let output_mode = state.output_mode;
+    let include_reasoning = req.include_reasoning;
     let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
@@ -198,13 +201,14 @@ pub async fn completions(
             response_rx,
             include_usage,
             output_mode,
+            include_reasoning,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         let (full_text, prompt_tokens, completion_tokens, finish_reason) =
-            collect_response(response_rx, output_mode).await?;
+            collect_response(response_rx, output_mode, include_reasoning).await?;
 
         let response = CompletionResponse {
             id: request_id,
@@ -355,6 +359,7 @@ fn validate_multimodal_inputs(
 async fn collect_response(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<EngineResponse>,
     output_mode: crate::gemma4_output::OutputMode,
+    include_reasoning: bool,
 ) -> Result<(String, usize, usize, String), (StatusCode, Json<ErrorResponse>)> {
     let mut full_text = String::new();
     let mut prompt_tokens = 0usize;
@@ -384,7 +389,7 @@ async fn collect_response(
         }
     }
 
-    full_text = output_mode.sanitize_text(&full_text);
+    full_text = output_mode.sanitize_text(&full_text, include_reasoning);
 
     Ok((full_text, prompt_tokens, completion_tokens, finish_reason))
 }

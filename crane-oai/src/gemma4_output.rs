@@ -10,17 +10,17 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    pub fn sanitize_text(self, text: &str) -> String {
+    pub fn sanitize_text(self, text: &str, include_reasoning: bool) -> String {
         match self {
             Self::Plain => text.to_string(),
-            Self::Gemma4 => sanitize_gemma4_output(text),
+            Self::Gemma4 => sanitize_gemma4_output(text, include_reasoning),
         }
     }
 
-    pub fn stream_sanitizer(self) -> Option<Gemma4StreamSanitizer> {
+    pub fn stream_sanitizer(self, include_reasoning: bool) -> Option<Gemma4StreamSanitizer> {
         match self {
             Self::Plain => None,
-            Self::Gemma4 => Some(Gemma4StreamSanitizer::default()),
+            Self::Gemma4 => Some(Gemma4StreamSanitizer::new(include_reasoning)),
         }
     }
 }
@@ -49,7 +49,7 @@ const GEMMA4_TAGS: &[&str] = &[
     "<|think|>",
 ];
 
-fn sanitize_gemma4_internal(input: &str, done: bool) -> String {
+fn sanitize_gemma4_internal(input: &str, done: bool, include_reasoning: bool) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
     let mut state = Gemma4ParseState::Normal;
@@ -105,9 +105,15 @@ fn sanitize_gemma4_internal(input: &str, done: bool) -> String {
             }
             Gemma4ParseState::Thinking => {
                 if let Some(pos) = rest.find(GEMMA4_THINK_CLOSE) {
+                    if include_reasoning {
+                        out.push_str(&rest[..pos]);
+                    }
                     i += pos + GEMMA4_THINK_CLOSE.len();
                     state = Gemma4ParseState::Normal;
                 } else if done {
+                    if include_reasoning {
+                        out.push_str(rest);
+                    }
                     i = input.len();
                     state = Gemma4ParseState::Normal;
                 } else {
@@ -132,8 +138,10 @@ fn sanitize_gemma4_internal(input: &str, done: bool) -> String {
 }
 
 /// Remove Gemma 4 control tags from final model output.
-pub fn sanitize_gemma4_output(text: &str) -> String {
-    sanitize_gemma4_internal(text, true).trim().to_string()
+pub fn sanitize_gemma4_output(text: &str, include_reasoning: bool) -> String {
+    sanitize_gemma4_internal(text, true, include_reasoning)
+        .trim()
+        .to_string()
 }
 
 /// Streaming sanitizer for Gemma 4 outputs. Accepts raw token deltas and
@@ -142,12 +150,23 @@ pub fn sanitize_gemma4_output(text: &str) -> String {
 pub struct Gemma4StreamSanitizer {
     raw: String,
     emitted: usize,
+    include_reasoning: bool,
+}
+
+impl Gemma4StreamSanitizer {
+    pub fn new(include_reasoning: bool) -> Self {
+        Self {
+            raw: String::new(),
+            emitted: 0,
+            include_reasoning,
+        }
+    }
 }
 
 impl Gemma4StreamSanitizer {
     pub fn push_chunk(&mut self, chunk: &str) -> String {
         self.raw.push_str(chunk);
-        let clean = sanitize_gemma4_internal(&self.raw, false);
+        let clean = sanitize_gemma4_internal(&self.raw, false, self.include_reasoning);
         if self.emitted > clean.len() {
             self.emitted = clean.len();
         }
@@ -157,7 +176,7 @@ impl Gemma4StreamSanitizer {
     }
 
     pub fn finish(&mut self) -> String {
-        let clean = sanitize_gemma4_internal(&self.raw, true);
+        let clean = sanitize_gemma4_internal(&self.raw, true, self.include_reasoning);
         if self.emitted > clean.len() {
             self.emitted = clean.len();
         }
@@ -174,16 +193,23 @@ mod tests {
     #[test]
     fn gemma4_sanitize_strips_control_tags() {
         let raw = "<|turn>model\nHello<turn|>\n<|tool_call>call:x{a:1}<tool_call|>";
-        let cleaned = sanitize_gemma4_output(raw);
+        let cleaned = sanitize_gemma4_output(raw, false);
         assert_eq!(cleaned, "Hello");
     }
 
     #[test]
     fn gemma4_stream_sanitizer_handles_split_tags() {
-        let mut s = Gemma4StreamSanitizer::default();
+        let mut s = Gemma4StreamSanitizer::new(false);
         assert_eq!(s.push_chunk("<|turn>model\nHe"), "He");
         assert_eq!(s.push_chunk("llo<turn"), "llo");
         assert_eq!(s.push_chunk("|>"), "");
         assert_eq!(s.finish(), "");
+    }
+
+    #[test]
+    fn gemma4_reasoning_can_be_included() {
+        let raw = "<|turn>model\nA<turn|><|channel>hidden-chain<channel|>";
+        let cleaned = sanitize_gemma4_output(raw, true);
+        assert!(cleaned.contains("hidden-chain"));
     }
 }

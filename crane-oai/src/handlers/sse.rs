@@ -22,11 +22,12 @@ pub fn make_chat_sse_stream(
     mut rx: mpsc::UnboundedReceiver<EngineResponse>,
     include_usage: bool,
     output_mode: OutputMode,
+    include_reasoning: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let created = now_epoch();
 
     async_stream::stream! {
-        let mut sanitizer = output_mode.stream_sanitizer();
+        let mut sanitizer = output_mode.stream_sanitizer(include_reasoning);
 
         // Role announcement chunk.
         let first_chunk = ChatCompletionChunk {
@@ -166,11 +167,12 @@ pub fn make_completion_sse_stream(
     mut rx: mpsc::UnboundedReceiver<EngineResponse>,
     include_usage: bool,
     output_mode: OutputMode,
+    include_reasoning: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let created = now_epoch();
 
     async_stream::stream! {
-        let mut sanitizer = output_mode.stream_sanitizer();
+        let mut sanitizer = output_mode.stream_sanitizer(include_reasoning);
 
         let mut _prompt_tokens = 0usize;
         let mut _completion_tokens = 0usize;

@@ -49,6 +49,9 @@ pub struct ChatCompletionRequest {
     pub n: Option<usize>,
     /// Response format constraint (e.g., `{"type": "json_object"}`).
     pub response_format: Option<ResponseFormat>,
+    /// If true, include Gemma4 reasoning channel content in the returned text.
+    #[serde(default)]
+    pub include_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,9 +112,9 @@ impl ChatMessage {
     pub fn has_multimodal_parts(&self) -> bool {
         match &self.content {
             ChatMessageContent::Text(_) => false,
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .any(|p| !matches!(p, ContentPart::Text { .. })),
+            ChatMessageContent::Parts(parts) => {
+                parts.iter().any(|p| !matches!(p, ContentPart::Text { .. }))
+            }
         }
     }
 }
@@ -260,6 +263,9 @@ pub struct CompletionRequest {
     pub echo: Option<bool>,
     pub seed: Option<u64>,
     pub n: Option<usize>,
+    /// If true, include Gemma4 reasoning channel content in the returned text.
+    #[serde(default)]
+    pub include_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
