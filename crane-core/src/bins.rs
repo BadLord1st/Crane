@@ -9,7 +9,6 @@ use std::io::Read;
  * it reads tensor by order:
  * [tensor1(dtype, shape_len, shape, data), tensor2, tensor3]
  */
-
 pub fn load_tensors(path: &str) -> Result<Vec<Tensor>> {
     let mut file = File::open(path)?;
     let mut tensors = Vec::new();

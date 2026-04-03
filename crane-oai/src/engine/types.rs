@@ -34,6 +34,17 @@ pub struct EngineRequest {
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
+/// Sampling and stop parameters for one generation request.
+#[derive(Debug, Clone)]
+pub struct GenerationParams {
+    pub max_tokens: usize,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub repetition_penalty: f32,
+    pub eos_token_id: Vec<u32>,
+}
+
 /// A response chunk from the engine to an API handler.
 #[derive(Debug, Clone)]
 pub enum EngineResponse {
@@ -63,24 +74,9 @@ impl EngineHandle {
         &self,
         id: String,
         tokens: Vec<u32>,
-        max_tokens: usize,
-        temperature: Option<f64>,
-        top_p: Option<f64>,
-        top_k: Option<usize>,
-        repetition_penalty: f32,
-        eos_token_id: Vec<u32>,
+        params: GenerationParams,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
-        self.submit_with_multimodal(
-            id,
-            tokens,
-            MultimodalInputs::default(),
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            repetition_penalty,
-            eos_token_id,
-        )
+        self.submit_with_multimodal(id, tokens, MultimodalInputs::default(), params)
     }
 
     /// Submit a generation request with optional multimodal payload.
@@ -89,13 +85,17 @@ impl EngineHandle {
         id: String,
         tokens: Vec<u32>,
         multimodal_inputs: MultimodalInputs,
-        max_tokens: usize,
-        temperature: Option<f64>,
-        top_p: Option<f64>,
-        top_k: Option<usize>,
-        repetition_penalty: f32,
-        eos_token_id: Vec<u32>,
+        params: GenerationParams,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
+        let GenerationParams {
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            eos_token_id,
+        } = params;
+
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
@@ -143,12 +143,14 @@ mod tests {
         let rx = handle.submit(
             "test-1".into(),
             vec![1, 2, 3],
-            10,
-            Some(0.8),
-            Some(0.95),
-            Some(40),
-            1.0,
-            vec![0],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: Some(0.8),
+                top_p: Some(0.95),
+                top_k: Some(40),
+                repetition_penalty: 1.0,
+                eos_token_id: vec![0],
+            },
         );
         assert!(rx.is_ok());
     }
@@ -164,18 +166,17 @@ mod tests {
         let result = handle.submit(
             "test-2".into(),
             vec![1],
-            10,
-            None,
-            None,
-            None,
-            1.0,
-            vec![0],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: 1.0,
+                eos_token_id: vec![0],
+            },
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("shut down"));
+        assert!(result.unwrap_err().to_string().contains("shut down"));
     }
 
     #[test]
@@ -207,7 +208,12 @@ mod tests {
             completion_tokens: 2,
             finish_reason: "stop".into(),
         };
-        if let EngineResponse::Finished { prompt_tokens, completion_tokens, .. } = &finished {
+        if let EngineResponse::Finished {
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } = &finished
+        {
             assert_eq!(*prompt_tokens, 5);
             assert_eq!(*completion_tokens, 2);
         }
@@ -239,16 +245,20 @@ mod tests {
             stats: Arc::new(EngineStats::new()),
         };
 
-        let _resp_rx = handle.submit(
-            "req-42".into(),
-            vec![10, 20, 30],
-            100,
-            Some(0.7),
-            Some(0.9),
-            None,
-            1.1,
-            vec![2],
-        ).unwrap();
+        let _resp_rx = handle
+            .submit(
+                "req-42".into(),
+                vec![10, 20, 30],
+                GenerationParams {
+                    max_tokens: 100,
+                    temperature: Some(0.7),
+                    top_p: Some(0.9),
+                    top_k: None,
+                    repetition_penalty: 1.1,
+                    eos_token_id: vec![2],
+                },
+            )
+            .unwrap();
 
         let req = rx.recv().await.unwrap();
         assert_eq!(req.id, "req-42");

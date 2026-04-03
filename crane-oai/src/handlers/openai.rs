@@ -19,7 +19,7 @@ use axum::{
     },
 };
 
-use crate::engine::{types::MultimodalInputs, EngineResponse};
+use crate::engine::{types::GenerationParams, types::MultimodalInputs, EngineResponse};
 use crate::openai_api::*;
 use crate::{make_error, now_epoch, AppState};
 use tracing::warn;
@@ -90,7 +90,7 @@ pub async fn chat_completions(
     let include_usage = req
         .stream_options
         .as_ref()
-        .map_or(false, |so| so.include_usage);
+        .is_some_and(|so| so.include_usage);
     let output_mode = state.output_mode;
     let include_reasoning = effective_include_reasoning(output_mode, req.include_reasoning);
     if matches!(output_mode, crate::gemma4_output::OutputMode::Gemma4) && !req.include_reasoning {
@@ -111,12 +111,14 @@ pub async fn chat_completions(
             request_id.clone(),
             input_ids,
             multimodal_inputs,
-            req.max_tokens,
-            req.temperature.or(default_temperature),
-            req.top_p.or(default_top_p),
-            req.top_k.or(default_top_k),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: req.max_tokens,
+                temperature: req.temperature.or(default_temperature),
+                top_p: req.top_p.or(default_top_p),
+                top_k: req.top_k.or(default_top_k),
+                repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
@@ -173,7 +175,7 @@ pub async fn completions(
     let include_usage = req
         .stream_options
         .as_ref()
-        .map_or(false, |so| so.include_usage);
+        .is_some_and(|so| so.include_usage);
 
     let input_ids = state
         .tokenizer
@@ -201,12 +203,14 @@ pub async fn completions(
         .submit(
             request_id.clone(),
             input_ids,
-            req.max_tokens,
-            req.temperature.or(default_temperature),
-            req.top_p.or(default_top_p),
-            req.top_k.or(default_top_k),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: req.max_tokens,
+                temperature: req.temperature.or(default_temperature),
+                top_p: req.top_p.or(default_top_p),
+                top_k: req.top_k.or(default_top_k),
+                repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 

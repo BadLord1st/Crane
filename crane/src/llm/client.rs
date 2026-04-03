@@ -8,11 +8,11 @@ use crane_core::generation::streamer::{AsyncTextStreamer, StreamerMessage};
 
 enum LoadedModel {
     Qwen25 {
-        model: crane_core::models::qwen25::Model,
-        tokenizer: crane_core::autotokenizer::AutoTokenizer,
+        model: Box<crane_core::models::qwen25::Model>,
+        tokenizer: Box<crane_core::autotokenizer::AutoTokenizer>,
     },
     HunyuanDense {
-        model: crane_core::models::hunyuan_dense::Model,
+        model: Box<crane_core::models::hunyuan_dense::Model>,
     },
 }
 
@@ -27,8 +27,10 @@ impl LlmClient {
     pub fn new(config: CommonConfig) -> CraneResult<Self> {
         let device = match &config.device {
             DeviceConfig::Cpu => crane_core::models::Device::Cpu,
-            DeviceConfig::Cuda(gpu_id) => crane_core::models::Device::cuda_if_available(*gpu_id as usize)
-                .map_err(|e| CraneError::ModelError(e.to_string()))?,
+            DeviceConfig::Cuda(gpu_id) => {
+                crane_core::models::Device::cuda_if_available(*gpu_id as usize)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?
+            }
             DeviceConfig::Metal => {
                 #[cfg(target_os = "macos")]
                 {
@@ -59,10 +61,14 @@ impl LlmClient {
                 )
                 .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
 
-                let mut model = crane_core::models::qwen25::Model::new(&config.model_path, &device, &dtype)
-                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                let mut model =
+                    crane_core::models::qwen25::Model::new(&config.model_path, &device, &dtype)
+                        .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 model.warmup();
-                LoadedModel::Qwen25 { model, tokenizer }
+                LoadedModel::Qwen25 {
+                    model: Box::new(model),
+                    tokenizer: Box::new(tokenizer),
+                }
             }
             LlmModelType::HunyuanDense => {
                 let mut model = crane_core::models::hunyuan_dense::Model::new(
@@ -72,12 +78,15 @@ impl LlmClient {
                 )
                 .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 model.warmup();
-                LoadedModel::HunyuanDense { model }
+                LoadedModel::HunyuanDense {
+                    model: Box::new(model),
+                }
             }
             _ => {
-                return Err(CraneError::ConfigError(
-                    format!("Unsupported model type: {:?}", config.model_type),
-                ));
+                return Err(CraneError::ConfigError(format!(
+                    "Unsupported model type: {:?}",
+                    config.model_type
+                )));
             }
         };
 
@@ -205,7 +214,10 @@ impl LlmClient {
                 let input_ids = model
                     .prepare_inputs(&prompt)
                     .map_err(|e| CraneError::ModelError(e.to_string()))?;
-                (input_ids, StreamTokenizer::Auto(tokenizer.clone()))
+                (
+                    input_ids,
+                    StreamTokenizer::Auto(Box::new(*tokenizer.clone())),
+                )
             }
             LoadedModel::HunyuanDense { model } => {
                 gen_config.eos_token_id = gen_config.eos_token_id.or(Some(120020));
@@ -213,20 +225,27 @@ impl LlmClient {
                 let input_ids = model
                     .prepare_inputs(&prompt)
                     .map_err(|e| CraneError::ModelError(e.to_string()))?;
-                (input_ids, StreamTokenizer::Tokenizer(model.tokenizer.tokenizer.clone()))
+                (
+                    input_ids,
+                    StreamTokenizer::Tokenizer(Box::new(model.tokenizer.tokenizer.clone())),
+                )
             }
         };
 
         let (mut streamer, receiver) = match tokenizer_for_stream {
-            StreamTokenizer::Auto(t) => AsyncTextStreamer::with_tokenizer(t),
-            StreamTokenizer::Tokenizer(t) => AsyncTextStreamer::with_tokenizer(t),
+            StreamTokenizer::Auto(t) => AsyncTextStreamer::with_tokenizer(*t),
+            StreamTokenizer::Tokenizer(t) => AsyncTextStreamer::with_tokenizer(*t),
         };
 
         let mut response_text = String::new();
         std::thread::scope(|scope| {
             let gen_handle = scope.spawn(|| match &mut self.model {
-                LoadedModel::Qwen25 { model, .. } => model.generate(&input_ids, &gen_config, Some(&mut streamer)),
-                LoadedModel::HunyuanDense { model } => model.generate(&input_ids, &gen_config, Some(&mut streamer)),
+                LoadedModel::Qwen25 { model, .. } => {
+                    model.generate(&input_ids, &gen_config, Some(&mut streamer))
+                }
+                LoadedModel::HunyuanDense { model } => {
+                    model.generate(&input_ids, &gen_config, Some(&mut streamer))
+                }
             });
 
             for message in receiver {
@@ -239,7 +258,9 @@ impl LlmClient {
             match gen_handle.join() {
                 Ok(Ok(_)) => Ok(()),
                 Ok(Err(e)) => Err(CraneError::ModelError(e.to_string())),
-                Err(_) => Err(CraneError::ModelError("Generation thread panicked".to_string())),
+                Err(_) => Err(CraneError::ModelError(
+                    "Generation thread panicked".to_string(),
+                )),
             }
         })?;
 
@@ -248,8 +269,8 @@ impl LlmClient {
 }
 
 enum StreamTokenizer {
-    Auto(crane_core::autotokenizer::AutoTokenizer),
-    Tokenizer(tokenizers::Tokenizer),
+    Auto(Box<crane_core::autotokenizer::AutoTokenizer>),
+    Tokenizer(Box<tokenizers::Tokenizer>),
 }
 
 fn hunyuan_apply_chat_template(messages: &[crane_core::chat::Message]) -> String {
@@ -263,7 +284,9 @@ fn hunyuan_apply_chat_template(messages: &[crane_core::chat::Message]) -> String
     result.push_str(BOS);
 
     let (system_msg, loop_messages) = match messages.first() {
-        Some(first) if matches!(first.role, crane_core::chat::Role::System) => (Some(&first.content), &messages[1..]),
+        Some(first) if matches!(first.role, crane_core::chat::Role::System) => {
+            (Some(&first.content), &messages[1..])
+        }
         _ => (None, messages),
     };
 

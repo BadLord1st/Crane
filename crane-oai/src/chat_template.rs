@@ -76,7 +76,7 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
         let (system_msg, loop_messages) = if !messages.is_empty() && messages[0].role == "system" {
             (Some(messages[0].text_content()), &messages[1..])
         } else {
-            (None, &messages[..])
+            (None, messages)
         };
 
         if let Some(sys) = system_msg {

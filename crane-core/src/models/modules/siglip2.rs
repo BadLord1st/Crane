@@ -6,8 +6,8 @@
 use crate::utils::utils;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{
-    conv2d_no_bias, embedding, layer_norm, linear, Activation, Conv2d, Conv2dConfig,
-    Embedding, LayerNorm, Linear, VarBuilder,
+    conv2d_no_bias, embedding, layer_norm, linear, Activation, Conv2d, Conv2dConfig, Embedding,
+    LayerNorm, Linear, VarBuilder,
 };
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -42,7 +42,7 @@ impl Siglip2MLP {
         Ok(Self {
             fc1,
             fc2,
-            activation: config.hidden_act.clone(),
+            activation: config.hidden_act,
         })
     }
 }
@@ -180,7 +180,7 @@ impl Siglip2Encoder {
     pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let layer = Siglip2EncoderLayer::new(config, vb.pp(&format!("layers.{i}")))?;
+            let layer = Siglip2EncoderLayer::new(config, vb.pp(format!("layers.{i}")))?;
             layers.push(layer);
         }
         Ok(Self {
@@ -230,7 +230,7 @@ impl Siglip2VisionEmbeddings {
         Ok(Self {
             patch_embedding,
             position_embedding,
-            position_embedding_size: (config.image_size / config.patch_size) as usize,
+            position_embedding_size: (config.image_size / config.patch_size),
             num_patches: config.num_patches,
             patch_size: config.patch_size,
         })
@@ -435,7 +435,6 @@ impl Siglip2VisionModel {
 }
 
 // Siglip2 Processor?
-
 
 pub fn test_main() {
     // let device = Device::Cpu;

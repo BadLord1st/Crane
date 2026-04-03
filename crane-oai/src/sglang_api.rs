@@ -372,6 +372,8 @@ mod tests {
             dtype: None,
             device: None,
             max_model_len: None,
+            accepts_image_inputs: false,
+            accepts_audio_inputs: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("dtype"));

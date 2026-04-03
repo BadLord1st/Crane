@@ -19,7 +19,6 @@ use clap::{Parser, ValueEnum};
 use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
-use crane_core::models::paddleocr_vl::PaddleOcrVL;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use gemma4_output::OutputMode;
@@ -81,8 +80,8 @@ struct Args {
     /// GPU memory limit. Accepts:
     ///   - Absolute size: "5G", "8G", "5120M", "5368709120" (bytes)
     ///   - Utilization fraction: "0.7" (70% of total GPU memory)
-    /// When the limit is reached, the engine stops admitting new sequences
-    /// until existing ones complete and free memory.
+    ///     When the limit is reached, the engine stops admitting new sequences
+    ///     until existing ones complete and free memory.
     #[arg(long)]
     gpu_memory_limit: Option<String>,
 
@@ -138,6 +137,17 @@ pub struct AppState {
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
 }
+
+type VlmTx = tokio::sync::mpsc::UnboundedSender<VlmRequest>;
+type TtsTx = tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>;
+type RuntimeInit = (
+    Option<EngineHandle>,
+    tokenizers::Tokenizer,
+    Vec<u32>,
+    Box<dyn ChatTemplateProcessor>,
+    Option<VlmTx>,
+    Option<TtsTx>,
+);
 
 // ═════════════════════════════════════════════════════════════
 //  Shared helpers
@@ -269,14 +279,8 @@ async fn main() -> Result<()> {
 
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
-    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt): (
-        Option<EngineHandle>,
-        tokenizers::Tokenizer,
-        Vec<u32>,
-        Box<dyn ChatTemplateProcessor>,
-        Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
-        Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
-    ) = if is_tts {
+    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt):
+        RuntimeInit = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();

@@ -630,12 +630,16 @@ impl Gemma4TextModel {
             .saturating_sub(cfg.num_kv_shared_layers.unwrap_or(0));
         let mut shared_kv_source = vec![None; cfg.num_hidden_layers];
         if first_shared_layer > 0 {
-            for layer_idx in first_shared_layer..cfg.num_hidden_layers {
+            for (layer_idx, shared_src) in shared_kv_source
+                .iter_mut()
+                .enumerate()
+                .skip(first_shared_layer)
+            {
                 let lt = cfg.layer_type(layer_idx);
                 let src = (0..first_shared_layer)
                     .rev()
                     .find(|&j| cfg.layer_type(j) == lt);
-                shared_kv_source[layer_idx] = src;
+                *shared_src = src;
             }
         }
 

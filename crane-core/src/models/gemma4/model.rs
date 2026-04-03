@@ -349,7 +349,7 @@ impl VisionTower {
                 intermediate_size,
                 num_heads,
                 eps,
-                act.clone(),
+                act,
                 vb.pp(format!("layers.{i}")),
             )?);
         }
@@ -510,7 +510,7 @@ impl AudioEncoderLayer {
                 hidden_size,
                 intermediate_size,
                 eps,
-                act.clone(),
+                act,
                 vb.pp("feed_forward1"),
             )?,
             ffn2: AudioFfnBlock::new(
@@ -564,7 +564,7 @@ impl AudioTower {
                 intermediate,
                 num_heads,
                 eps,
-                act.clone(),
+                act,
                 vb.pp(format!("{i}")),
             )?);
         }

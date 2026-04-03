@@ -2,9 +2,9 @@
 //!
 //! This example shows how to create a basic chat application using the Crane SDK.
 
-use crane::prelude::*;
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
 use crane::llm::{GenerationConfig, LlmModelType};
+use crane::prelude::*;
 
 fn main() -> CraneResult<()> {
     // Create a simple chat configuration

@@ -159,7 +159,7 @@ pub async fn vlm_chat_completions(
     let image_url = &image_urls[0];
 
     // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
+    let (_temp_dir, img_path) = download_image(image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
@@ -170,7 +170,7 @@ pub async fn vlm_chat_completions(
     if req.stream {
         // Streaming mode
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,
@@ -310,7 +310,7 @@ pub async fn vlm_generate(
     })?;
 
     // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
+    let (_temp_dir, img_path) = download_image(image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
@@ -323,7 +323,7 @@ pub async fn vlm_generate(
 
     if req.stream {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,

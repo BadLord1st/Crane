@@ -16,6 +16,10 @@ use candle_core::{DType, Device, Tensor};
 
 use super::types::MultimodalInputs;
 
+type LayerKv = Option<(Tensor, Tensor)>;
+type LayerKvCaches = Vec<LayerKv>;
+type SequenceKvCaches = Vec<LayerKvCaches>;
+
 // ─────────────────────────────────────────────────────────────
 //  Trait
 // ─────────────────────────────────────────────────────────────
@@ -75,12 +79,12 @@ pub trait ModelBackend: Send + 'static {
     }
 
     /// Extract per-layer KV caches from the model.
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    fn get_kv_caches(&self) -> LayerKvCaches {
         vec![]
     }
 
     /// Restore per-layer KV caches into the model.
-    fn set_kv_caches(&mut self, _caches: Vec<Option<(Tensor, Tensor)>>) {}
+    fn set_kv_caches(&mut self, _caches: LayerKvCaches) {}
 
     /// Compute bytes held by the model's active KV caches without copying.
     /// Used for memory tracking without the overhead of `get_kv_caches()`.
@@ -98,7 +102,7 @@ pub trait ModelBackend: Send + 'static {
     /// Pad and load per-sequence KV caches for batched decoding.
     fn setup_batch_decode(
         &mut self,
-        _seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        _seq_kv_caches: &[LayerKvCaches],
         _extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         candle_core::bail!("Batch decode not supported by this backend")
@@ -121,7 +125,7 @@ pub trait ModelBackend: Send + 'static {
         _kv_lens: &[usize],
         _original_max_kv: usize,
         _rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<SequenceKvCaches> {
         candle_core::bail!("Batch decode not supported by this backend")
     }
 
@@ -199,11 +203,11 @@ impl ModelBackend for HunyuanBackend {
         true
     }
 
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    fn get_kv_caches(&self) -> LayerKvCaches {
         self.model.get_kv_caches()
     }
 
-    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    fn set_kv_caches(&mut self, caches: LayerKvCaches) {
         self.model.set_kv_caches(caches);
     }
 
@@ -219,7 +223,7 @@ impl ModelBackend for HunyuanBackend {
 
     fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[LayerKvCaches],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         self.model.setup_batch_decode(seq_kv_caches, extra_room)
@@ -245,7 +249,7 @@ impl ModelBackend for HunyuanBackend {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<SequenceKvCaches> {
         self.model
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
@@ -401,11 +405,11 @@ impl ModelBackend for Qwen3Backend {
         true
     }
 
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    fn get_kv_caches(&self) -> LayerKvCaches {
         self.model.get_kv_caches()
     }
 
-    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    fn set_kv_caches(&mut self, caches: LayerKvCaches) {
         self.model.set_kv_caches(caches);
     }
 
@@ -421,7 +425,7 @@ impl ModelBackend for Qwen3Backend {
 
     fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[LayerKvCaches],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         self.model.setup_batch_decode(seq_kv_caches, extra_room)
@@ -447,7 +451,7 @@ impl ModelBackend for Qwen3Backend {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<SequenceKvCaches> {
         self.model
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }

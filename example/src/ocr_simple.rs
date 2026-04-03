@@ -30,7 +30,7 @@ fn main() -> CraneResult<()> {
 
     // streaming way
     let _ = ocr_client.extract_text_from_image_stream(image_path)?;
-    println!("");
+    println!();
 
     Ok(())
 }

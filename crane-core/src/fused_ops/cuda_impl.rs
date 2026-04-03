@@ -99,11 +99,7 @@ impl candle_core::CustomOp1 for FusedSiluMul {
     }
 
     #[cfg(feature = "cuda")]
-    fn cuda_fwd(
-        &self,
-        storage: &CudaStorage,
-        layout: &Layout,
-    ) -> Result<(CudaStorage, Shape)> {
+    fn cuda_fwd(&self, storage: &CudaStorage, layout: &Layout) -> Result<(CudaStorage, Shape)> {
         let dev = storage.device();
         let dims = layout.shape().dims();
         let last = *dims.last().unwrap();
@@ -212,21 +208,14 @@ impl FusedAddRmsNorm {
     /// Execute the fused add+rmsnorm on CUDA.
     ///
     /// `residual` is updated in-place. Returns normalized output.
-    pub fn fwd(
-        &self,
-        residual: &mut Tensor,
-        hidden: &Tensor,
-        weight: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn fwd(&self, residual: &mut Tensor, hidden: &Tensor, weight: &Tensor) -> Result<Tensor> {
         // Ensure all contiguous
         let residual_c = residual.contiguous()?;
         let hidden = hidden.contiguous()?;
         let weight = weight.contiguous()?;
 
         match residual_c.device() {
-            Device::Cuda(_) => {
-                self.cuda_fwd_inplace(residual, &hidden, &weight)
-            }
+            Device::Cuda(_) => self.cuda_fwd_inplace(residual, &hidden, &weight),
             _ => {
                 // CPU fallback: just do add + rmsnorm separately
                 let sum = (&residual_c + &hidden)?;

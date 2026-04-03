@@ -20,7 +20,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::engine::{types::MultimodalInputs, EngineResponse};
+use crate::engine::{types::GenerationParams, types::MultimodalInputs, EngineResponse};
 use crate::openai_api::ErrorResponse;
 use crate::sglang_api::*;
 use crate::{make_error, AppState};
@@ -103,12 +103,14 @@ pub async fn generate(
             request_id.clone(),
             input_ids,
             multimodal_inputs,
-            sp.max_new_tokens,
-            sp.temperature.or(default_temperature),
-            sp.top_p.or(default_top_p),
-            sp.top_k.or(default_top_k),
-            sp.repetition_penalty,
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: sp.max_new_tokens,
+                temperature: sp.temperature.or(default_temperature),
+                top_p: sp.top_p.or(default_top_p),
+                top_k: sp.top_k.or(default_top_k),
+                repetition_penalty: sp.repetition_penalty,
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
@@ -228,12 +230,14 @@ pub async fn health_generate(
         .submit(
             request_id,
             probe_tokens,
-            1,         // generate just 1 token
-            Some(0.0), // greedy
-            None,
-            None,
-            1.0,
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: 1,
+                temperature: Some(0.0),
+                top_p: None,
+                top_k: None,
+                repetition_penalty: 1.0,
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| {
             make_error(

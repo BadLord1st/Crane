@@ -37,7 +37,7 @@ impl OcrClient {
         );
         info!("device: {}, dtype: {}", config.device, config.dtype);
 
-        if std::path::Path::new(&config.model_path).exists() == false {
+        if !std::path::Path::new(&config.model_path).exists() {
             return Err(CraneError::ConfigError(format!(
                 "Model path does not exist: {}",
                 config.model_path
@@ -51,12 +51,12 @@ impl OcrClient {
         info!("model device: {:?}", model.device);
 
         #[cfg(target_os = "macos")]
-        if let DeviceConfig::Metal = config.device {
-            if !model.device.is_metal() {
-                return Err(CraneError::ConfigError(
-                    "Metal requested but not available".to_string(),
-                ));
-            }
+        if let DeviceConfig::Metal = config.device
+            && !model.device.is_metal()
+        {
+            return Err(CraneError::ConfigError(
+                "Metal requested but not available".to_string(),
+            ));
         }
 
         Ok(Self { config, model })
