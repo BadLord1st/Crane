@@ -47,6 +47,10 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub n: Option<usize>,
+    #[serde(default)]
+    pub tools: Option<Vec<ToolSpec>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
     /// Response format constraint (e.g., `{"type": "json_object"}`).
     pub response_format: Option<ResponseFormat>,
     /// If true, include Gemma4 reasoning channel content in the returned text.
@@ -190,6 +194,37 @@ pub struct ResponseFormat {
     pub r#type: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunctionSpec,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolFunctionSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Function {
+        r#type: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
 // ── Response ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,8 +240,31 @@ pub struct ChatCompletionResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatChoice {
     pub index: usize,
-    pub message: ChatMessage,
+    pub message: ChatCompletionMessage,
     pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 // ── Streaming ──
@@ -235,6 +293,27 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkToolCall {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ChunkToolCallFunction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkToolCallFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -635,9 +714,10 @@ mod tests {
             model: "test".into(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
+                message: ChatCompletionMessage {
                     role: "assistant".into(),
-                    content: "Hello!".into(),
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
             }],

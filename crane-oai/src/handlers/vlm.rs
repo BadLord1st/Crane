@@ -49,8 +49,7 @@ pub enum VlmRequest {
 /// Download an image from a URL to a temporary file.
 /// Returns the path to the temp file (the file persists until the TempDir is dropped).
 async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
-    let dir = tempfile::TempDir::new()
-        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let dir = tempfile::TempDir::new().map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
     let resp = reqwest::get(url)
         .await
@@ -129,9 +128,10 @@ pub async fn vlm_chat_completions(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let vlm_tx = state.vlm_tx.as_ref().ok_or_else(|| {
-        make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
-    })?;
+    let vlm_tx = state
+        .vlm_tx
+        .as_ref()
+        .ok_or_else(|| make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded"))?;
 
     // Extract image URLs and text from messages.
     let mut image_urls = Vec::new();
@@ -172,14 +172,20 @@ pub async fn vlm_chat_completions(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-        if vlm_tx.send(VlmRequest::RecognizeStream {
-            img_path,
-            task,
-            max_tokens,
-            token_tx: tx,
-            done_tx,
-        }).is_err() {
-            return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
+        if vlm_tx
+            .send(VlmRequest::RecognizeStream {
+                img_path,
+                task,
+                max_tokens,
+                token_tx: tx,
+                done_tx,
+            })
+            .is_err()
+        {
+            return Err(make_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "VLM engine thread crashed",
+            ));
         }
 
         let model_name = state.model_name.clone();
@@ -195,7 +201,8 @@ pub async fn vlm_chat_completions(
                 choices: vec![ChunkChoice {
                     index: 0,
                     delta: ChunkDelta {
-                        role: Some("assistant".into()),
+                            role: Some("assistant".into()),
+                            tool_calls: None,
                         content: None,
                     },
                     finish_reason: None,
@@ -219,6 +226,7 @@ pub async fn vlm_chat_completions(
                         delta: ChunkDelta {
                             role: None,
                             content: Some(text),
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -238,6 +246,7 @@ pub async fn vlm_chat_completions(
                     delta: ChunkDelta {
                         role: None,
                         content: None,
+                            tool_calls: None,
                     },
                     finish_reason: Some("stop".into()),
                 }],
@@ -253,18 +262,35 @@ pub async fn vlm_chat_completions(
     } else {
         // Non-streaming mode
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if vlm_tx.send(VlmRequest::Recognize {
-            img_path,
-            task,
-            max_tokens,
-            tx,
-        }).is_err() {
-            return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
+        if vlm_tx
+            .send(VlmRequest::Recognize {
+                img_path,
+                task,
+                max_tokens,
+                tx,
+            })
+            .is_err()
+        {
+            return Err(make_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "VLM engine thread crashed",
+            ));
         }
 
-        let result = rx.await
-            .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("VLM task dropped: {e}")))?
-            .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("VLM inference failed: {e}")))?;
+        let result = rx
+            .await
+            .map_err(|e| {
+                make_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("VLM task dropped: {e}"),
+                )
+            })?
+            .map_err(|e| {
+                make_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("VLM inference failed: {e}"),
+                )
+            })?;
 
         let response = ChatCompletionResponse {
             id: request_id,
@@ -273,9 +299,10 @@ pub async fn vlm_chat_completions(
             model: state.model_name.clone(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
+                message: ChatCompletionMessage {
                     role: "assistant".into(),
-                    content: ChatMessageContent::Text(result),
+                    content: Some(result),
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -298,9 +325,10 @@ pub async fn vlm_generate(
     state: Arc<AppState>,
     req: GenerateRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let vlm_tx = state.vlm_tx.as_ref().ok_or_else(|| {
-        make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
-    })?;
+    let vlm_tx = state
+        .vlm_tx
+        .as_ref()
+        .ok_or_else(|| make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded"))?;
 
     let image_url = req.image_url.as_deref().ok_or_else(|| {
         make_error(
@@ -325,14 +353,20 @@ pub async fn vlm_generate(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-        if vlm_tx.send(VlmRequest::RecognizeStream {
-            img_path,
-            task,
-            max_tokens,
-            token_tx: tx,
-            done_tx,
-        }).is_err() {
-            return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
+        if vlm_tx
+            .send(VlmRequest::RecognizeStream {
+                img_path,
+                task,
+                max_tokens,
+                token_tx: tx,
+                done_tx,
+            })
+            .is_err()
+        {
+            return Err(make_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "VLM engine thread crashed",
+            ));
         }
 
         let rid = request_id.clone();
@@ -364,18 +398,35 @@ pub async fn vlm_generate(
             .into_response())
     } else {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if vlm_tx.send(VlmRequest::Recognize {
-            img_path,
-            task,
-            max_tokens,
-            tx,
-        }).is_err() {
-            return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
+        if vlm_tx
+            .send(VlmRequest::Recognize {
+                img_path,
+                task,
+                max_tokens,
+                tx,
+            })
+            .is_err()
+        {
+            return Err(make_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "VLM engine thread crashed",
+            ));
         }
 
-        let result = rx.await
-            .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("VLM task dropped: {e}")))?
-            .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("VLM inference failed: {e}")))?;
+        let result = rx
+            .await
+            .map_err(|e| {
+                make_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("VLM task dropped: {e}"),
+                )
+            })?
+            .map_err(|e| {
+                make_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("VLM inference failed: {e}"),
+                )
+            })?;
 
         let response = GenerateResponse {
             text: result,

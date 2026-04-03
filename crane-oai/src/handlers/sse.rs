@@ -40,6 +40,7 @@ pub fn make_chat_sse_stream(
                 delta: ChunkDelta {
                     role: Some("assistant".into()),
                     content: None,
+                        tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -74,6 +75,7 @@ pub fn make_chat_sse_stream(
                             delta: ChunkDelta {
                                 role: None,
                                 content: Some(text),
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -100,6 +102,7 @@ pub fn make_chat_sse_stream(
                                     delta: ChunkDelta {
                                         role: None,
                                         content: Some(tail),
+                                        tool_calls: None,
                                     },
                                     finish_reason: None,
                                 }],
@@ -122,6 +125,7 @@ pub fn make_chat_sse_stream(
                             delta: ChunkDelta {
                                 role: None,
                                 content: None,
+                                tool_calls: None,
                             },
                             finish_reason: Some(finish_reason),
                         }],

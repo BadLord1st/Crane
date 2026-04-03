@@ -126,18 +126,25 @@ enum GpuTopkPlan {
     UseCpu,
 }
 
-fn max_gpu_topk_by_shared_mem() -> usize {
+fn max_gpu_topk_by_shared_mem(device: &Device) -> usize {
     // Matches the launch config in crane-core/src/fused_ops/cuda_impl.rs:
     // shared = block_dim(128) * k * (sizeof(f32) + sizeof(u32)).
-    // Without an explicit opt-in for larger dynamic shared memory, CUDA
-    // kernels are limited to 48 KiB dynamic shared memory per block.
+    // Budget is detected from the current CUDA device attributes.
     const DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES: usize = 48 * 1024;
     const TOPK_BLOCK_DIM: usize = 128;
     const BYTES_PER_TOPK_ENTRY: usize = std::mem::size_of::<f32>() + std::mem::size_of::<u32>();
-    (DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES / (TOPK_BLOCK_DIM * BYTES_PER_TOPK_ENTRY)).clamp(8, 64)
+
+    let smem_budget = detect_cuda_dynamic_smem_per_block_bytes(device)
+        .unwrap_or(DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES);
+    (smem_budget / (TOPK_BLOCK_DIM * BYTES_PER_TOPK_ENTRY)).clamp(8, 64)
 }
 
-fn build_gpu_topk_plan(seq: &Sequence, vocab: usize, top_p_active: bool) -> GpuTopkPlan {
+fn build_gpu_topk_plan(
+    seq: &Sequence,
+    vocab: usize,
+    top_p_active: bool,
+    device: &Device,
+) -> GpuTopkPlan {
     let mut top_k = seq.top_k.unwrap_or(0);
     if top_k == 0 && top_p_active {
         top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
@@ -146,12 +153,66 @@ fn build_gpu_topk_plan(seq: &Sequence, vocab: usize, top_p_active: bool) -> GpuT
             .unwrap_or(64);
     }
 
-    let top_k = top_k.min(max_gpu_topk_by_shared_mem()).min(vocab);
+    let top_k = top_k.min(max_gpu_topk_by_shared_mem(device)).min(vocab);
     if top_k > 0 && top_k < vocab {
         GpuTopkPlan::UseGpu { top_k }
     } else {
         GpuTopkPlan::UseCpu
     }
+}
+
+fn detect_cuda_dynamic_smem_per_block_bytes(device: &Device) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        if matches!(device, Device::Cuda(_)) {
+            let gpu_id = match device.location() {
+                candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id as i32,
+                _ => return None,
+            };
+
+            use candle_core::cuda_backend::cudarc::driver::{result, sys};
+
+            let _ = result::init();
+            let cu_dev = match result::device::get(gpu_id) {
+                Ok(d) => d,
+                Err(_) => return None,
+            };
+
+            // Prefer opt-in limit when available (newer architectures).
+            let optin = unsafe {
+                result::device::get_attribute(
+                    cu_dev,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                )
+            }
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| v as usize);
+
+            if optin.is_some() {
+                return optin;
+            }
+
+            let base = unsafe {
+                result::device::get_attribute(
+                    cu_dev,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+                )
+            }
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| v as usize);
+
+            return base;
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+    }
+
+    None
 }
 
 /// Sample a token from logits for a specific sequence.
@@ -237,7 +298,9 @@ pub fn sample(
             }
         }
 
-        if let GpuTopkPlan::UseGpu { top_k } = build_gpu_topk_plan(seq, vocab, top_p_active) {
+        if let GpuTopkPlan::UseGpu { top_k } =
+            build_gpu_topk_plan(seq, vocab, top_p_active, logits.device())
+        {
             let topk_idx = match crane_core::fused_ops::topk_indices(&logits, top_k) {
                 Ok(t) => t,
                 Err(e) => {
