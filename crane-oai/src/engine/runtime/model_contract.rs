@@ -116,11 +116,9 @@ impl BackendRuntimeShim {
 
 impl RuntimeModel for BackendRuntimeShim {
     fn prefill(&mut self, ctx: RuntimeRequestContext) -> Result<RuntimeStepOutput> {
-        let logits = self.backend.forward_prefill(
-            &ctx.input_ids,
-            ctx.start_pos,
-            &ctx.multimodal_inputs,
-        )?;
+        let logits =
+            self.backend
+                .forward_prefill(&ctx.input_ids, ctx.start_pos, &ctx.multimodal_inputs)?;
         Ok(RuntimeStepOutput {
             logits,
             state_delta: RuntimeStateDelta {
