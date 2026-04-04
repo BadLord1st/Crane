@@ -9,10 +9,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 
-use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::adapters::gemma4_adapter::Gemma4RuntimeAdapter;
+use super::adapters::hunyuan_adapter::HunyuanRuntimeAdapter;
+use super::adapters::qwen25_adapter::Qwen25RuntimeAdapter;
+use super::adapters::qwen3_adapter::Qwen3RuntimeAdapter;
 use super::runtime::{
-    BackendRuntimeShim, ChatFormatStrategy, ModelCapabilities as RuntimeCapabilities, ModelSpec,
-    OutputStrategy, RuntimeModel, SamplingDefaults,
+    ChatFormatStrategy, ModelCapabilities as RuntimeCapabilities, ModelSpec, OutputStrategy,
+    RuntimeModel, SamplingDefaults,
 };
 use crate::chat_template::{
     AutoChatTemplate, ChatTemplateProcessor, Gemma4ChatTemplate, HunyuanChatTemplate,
@@ -184,7 +187,10 @@ pub fn create_model_spec(model_type: ModelType, model_path: &str) -> ModelSpec {
         multimodal: base_caps.accepts_image_inputs || base_caps.accepts_audio_inputs,
         tool_call_tokens: matches!(resolved, ModelType::Gemma4),
         batch_decode: matches!(resolved, ModelType::HunyuanDense | ModelType::Qwen3),
-        kv_swap: matches!(resolved, ModelType::HunyuanDense | ModelType::Qwen3),
+        kv_swap: matches!(
+            resolved,
+            ModelType::HunyuanDense | ModelType::Qwen3 | ModelType::Gemma4
+        ),
         accepts_image_inputs: base_caps.accepts_image_inputs,
         accepts_audio_inputs: base_caps.accepts_audio_inputs,
     };
@@ -355,17 +361,14 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
     }
 }
 
-/// Create a model backend.
-pub fn create_backend(
+pub fn create_runtime_model(
     model_type: ModelType,
     model_path: &str,
     device: &Device,
     dtype: &DType,
     format: ModelFormat,
-) -> Result<Box<dyn ModelBackend>> {
+) -> Result<Box<dyn RuntimeModel>> {
     let model_type = resolve(model_type, model_path);
-    tracing::info!("Creating backend: {:?}", model_type);
-
     match model_type {
         ModelType::HunyuanDense => {
             let hy_fmt = match format {
@@ -375,47 +378,41 @@ pub fn create_backend(
                 ModelFormat::Gguf => crane_core::models::hunyuan_dense::ModelFormat::Gguf,
                 ModelFormat::Auto => crane_core::models::hunyuan_dense::ModelFormat::Auto,
             };
-            Ok(Box::new(HunyuanBackend::new(
+            Ok(Box::new(HunyuanRuntimeAdapter::new(
                 model_path, device, dtype, hy_fmt,
             )?))
         }
-        ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
-        ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
-        ModelType::Gemma4 => match format {
-            ModelFormat::Gguf => {
-                anyhow::bail!("Gemma 4 GGUF is not supported yet. Use safetensors checkpoints.")
+        ModelType::Qwen25 => Ok(Box::new(Qwen25RuntimeAdapter::new(
+            model_path, device, dtype,
+        )?)),
+        // Phase 3 reference path: Gemma4 runs on a native RuntimeModel adapter.
+        ModelType::Gemma4 => {
+            if matches!(format, ModelFormat::Gguf) {
+                anyhow::bail!("Gemma 4 GGUF is not supported yet. Use safetensors checkpoints.");
             }
-            ModelFormat::Auto | ModelFormat::Safetensors => {
-                Ok(Box::new(Gemma4Backend::new(model_path, device, dtype)?))
-            }
-        },
+            Ok(Box::new(Gemma4RuntimeAdapter::new(
+                model_path, device, dtype,
+            )?))
+        }
+        ModelType::Qwen3 => Ok(Box::new(Qwen3RuntimeAdapter::new(
+            model_path, device, dtype,
+        )?)),
         ModelType::PaddleOcrVl => {
             anyhow::bail!(
-                "PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()"
+                "PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_runtime_model()"
             )
         }
         ModelType::Qwen3TTS => {
             anyhow::bail!(
-                "Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()"
+                "Qwen3-TTS is a TTS model — use create_tts_model() instead of create_runtime_model()"
             )
         }
         ModelType::Auto => unreachable!(),
     }
 }
 
-pub fn create_runtime_model(
-    model_type: ModelType,
-    model_path: &str,
-    device: &Device,
-    dtype: &DType,
-    format: ModelFormat,
-) -> Result<Box<dyn RuntimeModel>> {
-    let backend = create_backend(model_type, model_path, device, dtype, format)?;
-    let shim = BackendRuntimeShim::new(backend);
-    Ok(Box::new(shim))
-}
-
 /// Create a chat template processor for the given model.
+#[allow(dead_code)]
 pub fn create_chat_template(
     model_type: ModelType,
     model_path: &str,

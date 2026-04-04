@@ -976,6 +976,28 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.inner.num_layers()
+    }
+
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.inner.get_kv_caches()
+    }
+
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        self.inner.set_kv_caches(caches);
+    }
+
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.inner.active_kv_cache_bytes()
+    }
+
+    /// Offload Gemma4 MoE expert tensors to CPU under memory pressure.
+    /// Returns number of moved tensor groups.
+    pub fn offload_experts_to_cpu(&mut self) -> usize {
+        self.inner.offload_experts_to_cpu()
+    }
+
     pub fn forward_step(
         &mut self,
         input_ids: &[u32],

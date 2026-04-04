@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Tensor, D};
@@ -47,6 +48,16 @@ pub struct Config {
     pub final_logit_softcapping: Option<f64>,
     pub rope_parameters: Option<RopeParameters>,
     pub num_kv_shared_layers: Option<usize>,
+    #[serde(default)]
+    pub enable_moe_block: bool,
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub top_k_experts: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub expert_intermediate_size: Option<usize>,
     pub use_double_wide_mlp: Option<bool>,
     pub eos_token_id: Option<u32>,
 }
@@ -240,6 +251,228 @@ impl Module for MLP {
 }
 
 #[derive(Debug, Clone)]
+struct Gemma4TextRouter {
+    proj: Linear,
+    scale: Tensor,
+    per_expert_scale: Tensor,
+    top_k_experts: usize,
+    eps: f64,
+    scalar_root_size: f64,
+}
+
+impl Gemma4TextRouter {
+    fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
+        let num_experts = cfg.num_experts.unwrap_or(0);
+        let top_k_experts = cfg.top_k_experts.unwrap_or(0);
+        if num_experts == 0 || top_k_experts == 0 {
+            candle_core::bail!("MoE router requires num_experts > 0 and top_k_experts > 0")
+        }
+
+        let proj = linear(cfg.hidden_size, num_experts, false, vb.pp("proj"))?;
+        let scale = vb.get(cfg.hidden_size, "scale")?;
+        let per_expert_scale = vb.get(num_experts, "per_expert_scale")?;
+
+        Ok(Self {
+            proj,
+            scale,
+            per_expert_scale,
+            top_k_experts,
+            eps: cfg.rms_norm_eps,
+            scalar_root_size: (cfg.hidden_size as f64).powf(-0.5),
+        })
+    }
+
+    fn route(&self, hidden_states: &Tensor) -> candle_core::Result<Vec<Vec<(usize, f32)>>> {
+        let x_dtype = hidden_states.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+
+        let hidden_size = hidden_states.dim(D::Minus1)?;
+        let x = hidden_states.to_dtype(internal_dtype)?;
+        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        let x_normed = x_normed.to_dtype(x_dtype)?;
+
+        let x_scaled = (x_normed.broadcast_mul(&self.scale)? * self.scalar_root_size)?;
+        let scores = x_scaled.apply(&self.proj)?;
+        let probs = softmax_last_dim_fallback(&scores)?;
+
+        let (num_tokens, num_experts) = probs.dims2()?;
+        let k = self.top_k_experts.min(num_experts);
+        if k == 0 {
+            return Ok(vec![Vec::new(); num_tokens]);
+        }
+
+        // Device-side top-k indices and probs.
+        let sorted_idx = probs.arg_sort_last_dim(false)?;
+        let topk_idx = sorted_idx.narrow(1, 0, k)?;
+        let topk_probs = probs.gather(&topk_idx, D::Minus1)?;
+
+        // Normalize top-k weights and apply per-expert scaling.
+        let topk_sum = topk_probs.sum_keepdim(D::Minus1)?;
+        let topk_norm = topk_probs.broadcast_div(&topk_sum)?;
+
+        let scale_2d = self
+            .per_expert_scale
+            .unsqueeze(0)?
+            .expand((num_tokens, num_experts))?;
+        let topk_scales = scale_2d.gather(&topk_idx, D::Minus1)?;
+        let topk_weights = topk_norm.broadcast_mul(&topk_scales)?;
+
+        // Only move compact [num_tokens, k] tensors to CPU.
+        let idx_cpu = topk_idx
+            .to_dtype(DType::U32)?
+            .to_device(&Device::Cpu)?
+            .to_vec2::<u32>()?;
+        let w_cpu = topk_weights
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec2::<f32>()?;
+
+        let mut routes = Vec::with_capacity(num_tokens);
+        for (idx_row, w_row) in idx_cpu.into_iter().zip(w_cpu.into_iter()) {
+            let mut row = Vec::with_capacity(k);
+            for (expert_idx, weight) in idx_row.into_iter().zip(w_row.into_iter()) {
+                row.push((expert_idx as usize, weight));
+            }
+            routes.push(row);
+        }
+        Ok(routes)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Gemma4TextExperts {
+    gate_up_proj: Tensor,
+    down_proj: Tensor,
+    act_fn: Activation,
+}
+
+impl Gemma4TextExperts {
+    fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
+        let num_experts = cfg.num_experts.unwrap_or(0);
+        let moe_intermediate_size = cfg
+            .moe_intermediate_size
+            .or(cfg.expert_intermediate_size)
+            .unwrap_or(0);
+
+        if num_experts == 0 || moe_intermediate_size == 0 {
+            candle_core::bail!("MoE experts require num_experts > 0 and moe_intermediate_size > 0")
+        }
+
+        let gate_up_proj = vb.get(
+            (num_experts, 2 * moe_intermediate_size, cfg.hidden_size),
+            "gate_up_proj",
+        )?;
+        let down_proj = vb.get(
+            (num_experts, cfg.hidden_size, moe_intermediate_size),
+            "down_proj",
+        )?;
+
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            act_fn: cfg.hidden_activation,
+        })
+    }
+
+    fn offload_to_cpu(&mut self) -> usize {
+        if matches!(self.gate_up_proj.device(), Device::Cpu) {
+            return 0;
+        }
+
+        let mut moved = 0usize;
+        if let Ok(t) = self.gate_up_proj.to_device(&Device::Cpu) {
+            self.gate_up_proj = t;
+            moved += 1;
+        }
+        if let Ok(t) = self.down_proj.to_device(&Device::Cpu) {
+            self.down_proj = t;
+            moved += 1;
+        }
+        moved
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Tensor,
+        routes: &[Vec<(usize, f32)>],
+    ) -> candle_core::Result<Tensor> {
+        let (num_tokens, hidden_size) = hidden_states.dims2()?;
+        if routes.len() != num_tokens {
+            candle_core::bail!("routes/token mismatch: {} vs {}", routes.len(), num_tokens)
+        }
+
+        let mut outputs = Tensor::zeros(
+            (num_tokens, hidden_size),
+            hidden_states.dtype(),
+            hidden_states.device(),
+        )?;
+
+        // Group token contributions by expert to run larger matmuls.
+        let mut per_expert: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for (token_idx, token_routes) in routes.iter().enumerate() {
+            for (expert_idx, weight) in token_routes {
+                if *weight == 0.0 {
+                    continue;
+                }
+                per_expert
+                    .entry(*expert_idx)
+                    .or_default()
+                    .push((token_idx, *weight));
+            }
+        }
+
+        let mut expert_cache: HashMap<usize, (Tensor, Tensor)> = HashMap::new();
+        for (expert_idx, assignments) in per_expert {
+            if assignments.is_empty() {
+                continue;
+            }
+
+            if let std::collections::hash_map::Entry::Vacant(e) = expert_cache.entry(expert_idx) {
+                let gate_up = self
+                    .gate_up_proj
+                    .narrow(0, expert_idx, 1)?
+                    .squeeze(0)?
+                    .to_device(hidden_states.device())?;
+                let down = self
+                    .down_proj
+                    .narrow(0, expert_idx, 1)?
+                    .squeeze(0)?
+                    .to_device(hidden_states.device())?;
+                e.insert((gate_up, down));
+            }
+            let (gate_up, down) = expert_cache.get(&expert_idx).unwrap();
+
+            let token_ids: Vec<u32> = assignments.iter().map(|(idx, _)| *idx as u32).collect();
+            let token_idx_t = Tensor::new(token_ids.as_slice(), hidden_states.device())?;
+            let expert_in = hidden_states.index_select(&token_idx_t, 0)?;
+
+            let gate_up_t = gate_up.transpose(0, 1)?;
+            let down_t = down.transpose(0, 1)?;
+
+            let gate_up_out = expert_in.matmul(&gate_up_t)?;
+            let interm = gate_up_out.dim(1)? / 2;
+            let gate = gate_up_out.narrow(1, 0, interm)?;
+            let up = gate_up_out.narrow(1, interm, interm)?;
+            let hidden = (gate.apply(&self.act_fn)? * up)?;
+            let mut expert_out = hidden.matmul(&down_t)?;
+
+            let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
+            let weights_t = Tensor::new(weights.as_slice(), hidden_states.device())?
+                .reshape((assignments.len(), 1))?;
+            expert_out = expert_out.broadcast_mul(&weights_t)?;
+
+            outputs = outputs.index_add(&token_idx_t, &expert_out, 0)?;
+        }
+
+        Ok(outputs)
+    }
+}
+
+#[derive(Debug, Clone)]
 enum KvCache {
     Normal(candle_nn::kv_cache::KvCache),
     Rotating(candle_nn::kv_cache::RotatingKvCache),
@@ -395,15 +628,50 @@ impl Attention {
             KvCache::Rotating(c) => c.reset(),
         }
     }
+
+    fn kv_seq_len(&self) -> usize {
+        match &self.kv_cache {
+            KvCache::Normal(c) => c.current_seq_len(),
+            KvCache::Rotating(c) => c.current_seq_len(),
+        }
+    }
+
+    fn kv_tensors(&self) -> Option<(Tensor, Tensor)> {
+        match &self.kv_cache {
+            KvCache::Normal(c) => c.k().ok().flatten().zip(c.v().ok().flatten()),
+            KvCache::Rotating(c) => c.k().ok().flatten().zip(c.v().ok().flatten()),
+        }
+    }
+
+    fn restore_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
+        self.clear_kv_cache();
+        let Some((k, v)) = cache else {
+            return;
+        };
+
+        match &mut self.kv_cache {
+            KvCache::Normal(c) => {
+                let _ = c.append(&k, &v);
+            }
+            KvCache::Rotating(c) => {
+                let _ = c.append(&k, &v);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
     mlp: MLP,
+    router: Option<Gemma4TextRouter>,
+    experts: Option<Gemma4TextExperts>,
     input_layernorm: RmsNorm,
     pre_feedforward_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
+    pre_feedforward_layernorm_2: Option<RmsNorm>,
+    post_feedforward_layernorm_1: Option<RmsNorm>,
+    post_feedforward_layernorm_2: Option<RmsNorm>,
     post_attention_layernorm: RmsNorm,
     layer_scalar: Tensor,
     per_layer_input_gate: Option<Linear>,
@@ -422,6 +690,37 @@ impl DecoderLayer {
             cfg.hidden_activation,
             vb.pp("mlp"),
         )?;
+
+        let enable_moe = cfg.enable_moe_block;
+        let (
+            router,
+            experts,
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_1,
+            post_feedforward_layernorm_2,
+        ) = if enable_moe {
+            (
+                Some(Gemma4TextRouter::new(cfg, vb.pp("router"))?),
+                Some(Gemma4TextExperts::new(cfg, vb.pp("experts"))?),
+                Some(RmsNorm::new(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb.pp("pre_feedforward_layernorm_2"),
+                )?),
+                Some(RmsNorm::new(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb.pp("post_feedforward_layernorm_1"),
+                )?),
+                Some(RmsNorm::new(
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                    vb.pp("post_feedforward_layernorm_2"),
+                )?),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
 
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -471,9 +770,14 @@ impl DecoderLayer {
         Ok(Self {
             self_attn,
             mlp,
+            router,
+            experts,
             input_layernorm,
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_1,
+            post_feedforward_layernorm_2,
             post_attention_layernorm,
             layer_scalar,
             per_layer_input_gate,
@@ -502,7 +806,27 @@ impl DecoderLayer {
 
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
-        let xs = xs.apply(&self.mlp)?;
+        let mut xs = xs.apply(&self.mlp)?;
+
+        if let (Some(router), Some(experts), Some(pre_ff2), Some(post_ff1), Some(post_ff2)) = (
+            self.router.as_ref(),
+            self.experts.as_mut(),
+            self.pre_feedforward_layernorm_2.as_ref(),
+            self.post_feedforward_layernorm_1.as_ref(),
+            self.post_feedforward_layernorm_2.as_ref(),
+        ) {
+            let (b, s, h) = residual.dims3()?;
+            let residual_flat = residual.reshape((b * s, h))?;
+            let routes = router.route(&residual_flat)?;
+
+            let moe_in = residual_flat.apply(pre_ff2)?;
+            let moe_out = experts.forward(&moe_in, &routes)?;
+            let moe_out = moe_out.reshape((b, s, h))?.apply(post_ff2)?;
+
+            let mlp_out = xs.apply(post_ff1)?;
+            xs = (mlp_out + moe_out)?;
+        }
+
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
         let mut xs = (residual + xs)?;
 
@@ -530,6 +854,13 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache()
+    }
+
+    fn offload_experts_to_cpu(&mut self) -> usize {
+        self.experts
+            .as_mut()
+            .map(|e| e.offload_to_cpu())
+            .unwrap_or(0)
     }
 }
 
@@ -816,6 +1147,63 @@ impl Gemma4TextModel {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
+        }
+    }
+
+    pub fn offload_experts_to_cpu(&mut self) -> usize {
+        let mut moved = 0usize;
+        for layer in self.layers.iter_mut() {
+            moved += layer.offload_experts_to_cpu();
+        }
+        moved
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .self_attn
+                    .kv_tensors()
+                    .map(|(k, v)| {
+                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Extract per-layer KV caches (valid portion only).
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                layer.self_attn.kv_tensors().map(|(k, v)| {
+                    let len = layer.self_attn.kv_seq_len();
+                    if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        (
+                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                        )
+                    } else {
+                        (k, v)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Restore per-layer KV caches.
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            layer.self_attn.restore_kv_cache(cache);
         }
     }
 }
