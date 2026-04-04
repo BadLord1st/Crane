@@ -1,7 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
-use crate::engine::backend::ModelBackend;
 use crate::engine::types::MultimodalInputs;
 
 pub type LayerKv = Option<(Tensor, Tensor)>;
@@ -29,10 +28,12 @@ pub struct BatchDecodeContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct RuntimeStateDelta {
     pub consumed_tokens: usize,
 }
 
+#[allow(dead_code)]
 pub struct RuntimeStepOutput {
     pub logits: Tensor,
     pub state_delta: RuntimeStateDelta,
@@ -67,6 +68,73 @@ pub trait RuntimeModel: Send + 'static {
         0
     }
 
+    /// Called by the engine when memory pressure is detected.
+    /// Runtime backend decides what to offload (experts, blocks, caches, etc.).
+    /// Returns number of offloaded units.
+    fn offload_under_memory_pressure(&mut self) -> usize {
+        0
+    }
+
+    /// Move inactive sequence KV caches away from model device.
+    /// Returns number of tensors moved.
+    fn offload_kv_caches(&self, caches: &mut LayerKvCaches) -> usize {
+        if matches!(self.device(), Device::Cpu) {
+            return 0;
+        }
+
+        let mut moved = 0usize;
+        for cache in caches {
+            let Some((k, v)) = cache else {
+                continue;
+            };
+            if matches!(k.device(), Device::Cpu) {
+                continue;
+            }
+
+            let Ok(new_k) = k.to_device(&Device::Cpu) else {
+                continue;
+            };
+            let Ok(new_v) = v.to_device(&Device::Cpu) else {
+                continue;
+            };
+
+            *k = new_k;
+            *v = new_v;
+            moved += 2;
+        }
+        moved
+    }
+
+    /// Move sequence KV caches onto model device before restore/decode.
+    /// Returns number of tensors moved.
+    fn prefetch_kv_caches(&self, caches: &mut LayerKvCaches) -> usize {
+        if matches!(self.device(), Device::Cpu) {
+            return 0;
+        }
+
+        let mut moved = 0usize;
+        for cache in caches {
+            let Some((k, v)) = cache else {
+                continue;
+            };
+            if !matches!(k.device(), Device::Cpu) {
+                continue;
+            }
+
+            let Ok(new_k) = k.to_device(self.device()) else {
+                continue;
+            };
+            let Ok(new_v) = v.to_device(self.device()) else {
+                continue;
+            };
+
+            *k = new_k;
+            *v = new_v;
+            moved += 2;
+        }
+        moved
+    }
+
     fn supports_batch_decode(&self) -> bool {
         false
     }
@@ -97,128 +165,6 @@ pub trait RuntimeModel: Send + 'static {
         candle_core::bail!("Batch decode not supported by this runtime")
     }
 
+    #[allow(dead_code)]
     fn on_device_policy_tick(&mut self) {}
-}
-
-pub struct BackendRuntimeShim {
-    backend: Box<dyn ModelBackend>,
-}
-
-impl BackendRuntimeShim {
-    pub fn new(backend: Box<dyn ModelBackend>) -> Self {
-        Self { backend }
-    }
-
-    pub fn into_backend(self) -> Box<dyn ModelBackend> {
-        self.backend
-    }
-}
-
-impl RuntimeModel for BackendRuntimeShim {
-    fn prefill(&mut self, ctx: RuntimeRequestContext) -> Result<RuntimeStepOutput> {
-        let logits =
-            self.backend
-                .forward_prefill(&ctx.input_ids, ctx.start_pos, &ctx.multimodal_inputs)?;
-        Ok(RuntimeStepOutput {
-            logits,
-            state_delta: RuntimeStateDelta {
-                consumed_tokens: ctx.input_ids.len(),
-            },
-        })
-    }
-
-    fn decode(&mut self, ctx: RuntimeStepContext) -> Result<RuntimeStepOutput> {
-        let logits = self.backend.forward_step(&ctx.input_ids, ctx.start_pos)?;
-        Ok(RuntimeStepOutput {
-            logits,
-            state_delta: RuntimeStateDelta {
-                consumed_tokens: ctx.input_ids.len(),
-            },
-        })
-    }
-
-    fn batch_decode(&mut self, ctx: BatchDecodeContext<'_>) -> candle_core::Result<Tensor> {
-        self.backend.step_batch_decode(
-            ctx.input_ids,
-            ctx.positions,
-            ctx.attention_mask,
-            ctx.batch_kv_info,
-        )
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.backend.clear_kv_cache();
-    }
-
-    fn num_layers(&self) -> usize {
-        self.backend.num_layers()
-    }
-
-    fn device(&self) -> &Device {
-        self.backend.device()
-    }
-
-    fn dtype(&self) -> DType {
-        self.backend.dtype()
-    }
-
-    fn tokenizer(&self) -> &tokenizers::Tokenizer {
-        self.backend.tokenizer()
-    }
-
-    fn eos_token_id(&self) -> Vec<u32> {
-        self.backend.eos_token_id()
-    }
-
-    fn warmup(&mut self) {
-        self.backend.warmup();
-    }
-
-    fn supports_kv_swap(&self) -> bool {
-        self.backend.supports_kv_swap()
-    }
-
-    fn kv_extract(&self) -> LayerKvCaches {
-        self.backend.get_kv_caches()
-    }
-
-    fn kv_restore(&mut self, caches: LayerKvCaches) {
-        self.backend.set_kv_caches(caches);
-    }
-
-    fn kv_bytes(&self) -> u64 {
-        self.backend.active_kv_cache_bytes()
-    }
-
-    fn supports_batch_decode(&self) -> bool {
-        self.backend.supports_batch_decode()
-    }
-
-    fn setup_batch_decode(
-        &mut self,
-        seq_kv_caches: &[LayerKvCaches],
-        extra_room: usize,
-    ) -> candle_core::Result<(Vec<usize>, usize)> {
-        self.backend.setup_batch_decode(seq_kv_caches, extra_room)
-    }
-
-    fn extract_batch_kv(
-        &mut self,
-        kv_lens: &[usize],
-        original_max_kv: usize,
-        rounds_done: usize,
-    ) -> candle_core::Result<SequenceKvCaches> {
-        self.backend
-            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
-    }
-
-    fn build_batch_decode_mask(
-        &self,
-        kv_lens: &[usize],
-        original_max_kv: usize,
-        max_total_width: usize,
-    ) -> candle_core::Result<Option<Tensor>> {
-        self.backend
-            .build_batch_decode_mask(kv_lens, original_max_kv, max_total_width)
-    }
 }

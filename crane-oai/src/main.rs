@@ -6,7 +6,7 @@ mod openai_api;
 mod sglang_api;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
@@ -17,9 +17,11 @@ use axum::{
 };
 use clap::{Parser, ValueEnum};
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
+use engine::policies::placement_policy::PlacementPolicy;
 use engine::runtime::ModelSpec;
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use gemma4_output::OutputMode;
@@ -92,6 +94,10 @@ struct Args {
     /// off: never auto-apply safety defaults.
     #[arg(long, value_enum, default_value_t = SafeMode::Auto)]
     safe_mode: SafeMode,
+
+    /// Device placement policy for runtime hooks.
+    #[arg(long, value_enum, default_value_t = PlacementMode::KeepOnDevice)]
+    placement_policy: PlacementMode,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -99,6 +105,30 @@ enum SafeMode {
     Auto,
     On,
     Off,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum PlacementMode {
+    KeepOnDevice,
+    OffloadReady,
+}
+
+impl From<PlacementMode> for PlacementPolicy {
+    fn from(value: PlacementMode) -> Self {
+        match value {
+            PlacementMode::KeepOnDevice => PlacementPolicy::KeepOnDevice,
+            PlacementMode::OffloadReady => PlacementPolicy::OffloadReady,
+        }
+    }
+}
+
+impl PlacementMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PlacementMode::KeepOnDevice => "keep_on_device",
+            PlacementMode::OffloadReady => "offload_ready",
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -138,6 +168,7 @@ pub struct AppState {
     pub decode_tokens_per_seq: usize,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
+    pub placement_policy: String,
 }
 
 type VlmTx = tokio::sync::mpsc::UnboundedSender<VlmRequest>;
@@ -192,9 +223,19 @@ pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorRespo
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("crane_oai=debug,crane_core=info,info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_line_number(true)
+        .with_file(true)
+        .with_writer(std::io::stdout)
+        .init();
 
     let mut args = Args::parse();
+    let startup_t0 = Instant::now();
 
     info!("Loading model from: {}", args.model_path);
 
@@ -255,6 +296,32 @@ async fn main() -> Result<()> {
     let is_tts = resolved_type.is_tts();
     let model_spec = engine::model_factory::create_model_spec(resolved_type, &args.model_path);
 
+    info!(
+        "Startup config: model_type_arg={}, resolved_model_type={}, format={}, host={}, port={}, cpu={}, max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, gpu_memory_limit={}",
+        args.model_type,
+        resolved_type.display_name(),
+        args.format,
+        args.host,
+        args.port,
+        args.cpu,
+        args.max_concurrent,
+        args.decode_tokens_per_seq,
+        args.max_seq_len,
+        args.gpu_memory_limit
+            .clone()
+            .unwrap_or_else(|| "unlimited".to_string()),
+    );
+    info!(
+        "Model spec: text={}, multimodal={}, tool_call_tokens={}, batch_decode={}, kv_swap={}, chat_format={:?}, output_strategy={:?}",
+        model_spec.capabilities.text,
+        model_spec.capabilities.multimodal,
+        model_spec.capabilities.tool_call_tokens,
+        model_spec.capabilities.batch_decode,
+        model_spec.capabilities.kv_swap,
+        model_spec.chat_format_strategy,
+        model_spec.output_strategy,
+    );
+
     let using_default_batch = args.max_concurrent == 16 && args.decode_tokens_per_seq == 16;
     let using_unbounded_ctx = args.max_seq_len == 0;
     let using_unbounded_mem = args.gpu_memory_limit.is_none();
@@ -282,6 +349,7 @@ async fn main() -> Result<()> {
 
     let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt):
         RuntimeInit = if is_tts {
+        info!("Startup phase=mode_select mode=tts");
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -309,6 +377,7 @@ async fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("tts-engine".into())
             .spawn(move || {
+                let tts_load_t0 = Instant::now();
                 let mut tts = match engine::model_factory::create_tts_model(
                     &model_path_clone,
                     &tts_device,
@@ -320,7 +389,10 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                info!("TTS engine thread started");
+                info!(
+                    "TTS engine thread started (model_load_ms={})",
+                    tts_load_t0.elapsed().as_millis()
+                );
 
                 while let Some(req) = tts_rx.blocking_recv() {
                     let result = (|| -> Result<handlers::tts::TtsResult, String> {
@@ -448,6 +520,7 @@ async fn main() -> Result<()> {
             Some(tts_tx),
         )
     } else if is_vlm {
+        info!("Startup phase=mode_select mode=vlm");
         // VLM path: create PaddleOcrVL on a dedicated thread to avoid Send/Sync issues.
         info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);
 
@@ -473,6 +546,7 @@ async fn main() -> Result<()> {
         std::thread::Builder::new()
             .name("vlm-engine".into())
             .spawn(move || {
+                let vlm_load_t0 = Instant::now();
                 let mut vlm = match engine::model_factory::create_vlm_model(
                     &model_path_clone,
                     use_cpu,
@@ -484,7 +558,10 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                info!("VLM engine thread started");
+                info!(
+                    "VLM engine thread started (model_load_ms={})",
+                    vlm_load_t0.elapsed().as_millis()
+                );
 
                 while let Some(req) = vlm_rx.blocking_recv() {
                     match req {
@@ -550,7 +627,9 @@ async fn main() -> Result<()> {
             None,
         )
     } else {
+        info!("Startup phase=mode_select mode=llm");
         // Standard LLM path.
+        let llm_load_t0 = Instant::now();
         let mut backend = engine::model_factory::create_runtime_model(
             model_type,
             &args.model_path,
@@ -560,12 +639,16 @@ async fn main() -> Result<()> {
         )?;
 
         info!(
-            "Model loaded successfully (type: {:?}, format: {:?})",
-            resolved_type, format,
+            "Model loaded successfully (type: {:?}, format: {:?}, model_load_ms={})",
+            resolved_type,
+            format,
+            llm_load_t0.elapsed().as_millis(),
         );
+        info!("Placement policy: {:?}", args.placement_policy);
 
+        let warmup_t0 = Instant::now();
         backend.warmup();
-        info!("Model warmed up");
+        info!("Model warmed up (warmup_ms={})", warmup_t0.elapsed().as_millis());
 
         // Clone tokenizer and get EOS token before moving backend into engine.
         let tokenizer = backend.tokenizer().clone();
@@ -575,12 +658,13 @@ async fn main() -> Result<()> {
             engine::model_factory::create_chat_template_from_spec(&model_spec, &args.model_path);
 
         // ── Parse memory config ──
+        let memory_init_t0 = Instant::now();
         let mut memory_config =
             MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
         info!(
-            "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
+            "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
             if memory_config.max_seq_len == 0 {
                 "unlimited".to_string()
             } else {
@@ -592,6 +676,7 @@ async fn main() -> Result<()> {
                 format_bytes(memory_config.gpu_memory_limit_bytes)
             },
             format_bytes(baseline_gpu),
+            memory_init_t0.elapsed().as_millis(),
         );
 
         // ── Start engine on dedicated thread ──
@@ -599,6 +684,7 @@ async fn main() -> Result<()> {
             backend,
             args.max_concurrent,
             args.decode_tokens_per_seq,
+            args.placement_policy.into(),
             memory_config,
         );
 
@@ -634,6 +720,7 @@ async fn main() -> Result<()> {
         .gpu_memory_limit
         .clone()
         .unwrap_or_else(|| "unlimited".to_string());
+    let placement_policy_display = args.placement_policy.as_str().to_string();
     let output_mode = engine::policies::output_policy::output_mode(model_spec.output_strategy);
     let accepts_image_inputs = model_spec.capabilities.accepts_image_inputs;
     let accepts_audio_inputs = model_spec.capabilities.accepts_audio_inputs;
@@ -663,13 +750,16 @@ async fn main() -> Result<()> {
         decode_tokens_per_seq: args.decode_tokens_per_seq,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
+        placement_policy: placement_policy_display,
     });
 
     let app = build_router(state.clone());
 
     let addr = format!("{}:{}", args.host, args.port);
+    info!("Startup phase=bind address={}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;
+    info!("Startup phase=bind_complete local_addr={}", local_addr);
 
     // ── Startup banner (printed after successful bind) ──
 
@@ -725,6 +815,7 @@ async fn main() -> Result<()> {
     println!("    POST  http://{local_addr}/generate");
     println!("    GET   http://{local_addr}/model_info");
     println!("    GET   http://{local_addr}/server_info");
+    println!("    GET   http://{local_addr}/engine_info");
     println!("    GET   http://{local_addr}/health_generate");
     println!("    POST  http://{local_addr}/flush_cache");
     println!("    POST  http://{local_addr}/abort_request");
@@ -733,6 +824,14 @@ async fn main() -> Result<()> {
     println!("    GET   http://{local_addr}/health");
     println!("    GET   http://{local_addr}/v1/stats");
     println!("  {sep}\n");
+
+    info!(
+        "Startup complete (total_startup_ms={}, model_type={}, device={}, dtype={})",
+        startup_t0.elapsed().as_millis(),
+        resolved_type.display_name(),
+        state.device_name,
+        state.dtype_name,
+    );
 
     axum::serve(listener, app).await?;
 
@@ -766,6 +865,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/generate", post(handlers::sglang::generate))
         .route("/model_info", get(handlers::sglang::model_info))
         .route("/server_info", get(handlers::sglang::server_info))
+        .route("/engine_info", get(handlers::sglang::engine_info))
         .route("/health_generate", get(handlers::sglang::health_generate))
         .route(
             "/flush_cache",

@@ -24,10 +24,9 @@
 //! | `sampling`      | Token sampling (top-k, top-p, Gumbel-max, etc.) |
 //! | `scheduler`     | FIFO scheduler with prefill priority              |
 //! | `sequence`      | Per-request lifecycle state                       |
-//! | `backend`       | `ModelBackend` trait + concrete implementations   |
+//! | `runtime`       | Runtime model contracts + capabilities             |
 //! | `model_factory` | Auto-detection and factory creation               |
 
-pub mod backend;
 pub mod adapters;
 pub mod model_factory;
 pub mod policies;
@@ -51,6 +50,7 @@ use candle_core::{Device, Tensor};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::engine::policies::placement_policy::PlacementPolicy;
 use crane_core::utils::token_output_stream::TokenOutputStream;
 use runtime::{BatchDecodeContext, RuntimeModel, RuntimeRequestContext, RuntimeStepContext};
 use sampling::SamplingBuffers;
@@ -204,6 +204,7 @@ const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
 pub struct InferenceEngine {
     model: Box<dyn RuntimeModel>,
     sequences: HashMap<String, Sequence>,
+    request_states: HashMap<String, runtime::request_state::RequestState>,
     token_streams: HashMap<String, TokenOutputStream>,
     scheduler: Scheduler,
     request_rx: mpsc::UnboundedReceiver<EngineRequest>,
@@ -217,13 +218,13 @@ pub struct InferenceEngine {
     /// Step counter for periodic stats logging.
     step_counter: u64,
     sampling_buffers: SamplingBuffers,
+    input_builder: runtime::input_builder::IncrementalInputBuilder,
+    kv_manager: runtime::kv_manager::KvMemoryManager,
+    placement_policy: PlacementPolicy,
     /// Memory configuration for VRAM limits.
     memory_config: MemoryConfig,
     /// Timestamp of last memory-limit warning (to throttle log spam).
     last_mem_warn: Instant,
-    /// Tracked total KV cache bytes across all sequences (not relying on
-    /// `cuMemGetInfo` which includes CUDA allocator pool bloat).
-    tracked_kv_bytes: u64,
     /// Steps remaining before cuMemGetInfo checks are re-enabled after eviction.
     /// The CUDA caching allocator doesn't instantly reflect freed memory, so we
     /// grant a short cooldown after preemption to avoid a deadlock where
@@ -237,6 +238,7 @@ impl InferenceEngine {
         model: Box<dyn RuntimeModel>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
+        placement_policy: PlacementPolicy,
         memory_config: MemoryConfig,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
@@ -259,6 +261,7 @@ impl InferenceEngine {
         let engine = Self {
             model,
             sequences: HashMap::new(),
+            request_states: HashMap::new(),
             token_streams: HashMap::new(),
             scheduler: Scheduler::new(effective_max),
             request_rx,
@@ -269,9 +272,11 @@ impl InferenceEngine {
             start_time: Instant::now(),
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
+            input_builder: runtime::input_builder::IncrementalInputBuilder::default(),
+            kv_manager: runtime::kv_manager::KvMemoryManager::default(),
+            placement_policy,
             memory_config,
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
-            tracked_kv_bytes: 0,
             eviction_cooldown: 0,
         };
         let handle = EngineHandle { request_tx, stats };
@@ -320,6 +325,9 @@ impl InferenceEngine {
         loop {
             self.drain_requests();
             self.check_cancelled();
+            if matches!(self.placement_policy, PlacementPolicy::OffloadReady) {
+                self.model.on_device_policy_tick();
+            }
 
             // Decrement eviction cooldown (cuMemGetInfo grace period).
             self.eviction_cooldown = self.eviction_cooldown.saturating_sub(1);
@@ -335,11 +343,38 @@ impl InferenceEngine {
 
             match output {
                 Some(output) => {
+                    debug!(
+                        is_prefill = output.is_prefill,
+                        batch_size = output.batch.len(),
+                        running = self.scheduler.running.len(),
+                        waiting = self.scheduler.waiting.len(),
+                        "Scheduler emitted batch"
+                    );
                     // KV cache budget gate: if a prefill is scheduled but we're
                     // over the KV budget, first try to evict (preempt) the
                     // largest running sequence to make room. If still over,
                     // defer the prefill and drain existing sequences.
                     if output.is_prefill && self.is_over_kv_budget() {
+                        if matches!(self.placement_policy, PlacementPolicy::OffloadReady) {
+                            let runtime_offloaded = self.model.offload_under_memory_pressure();
+                            if runtime_offloaded > 0 {
+                                self.stats
+                                    .total_runtime_offload_ops
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.stats
+                                    .total_runtime_offload_units
+                                    .fetch_add(runtime_offloaded as u64, Ordering::Relaxed);
+                                info!(
+                                    runtime_offloaded,
+                                    "Runtime backend offloaded memory-managed units under pressure"
+                                );
+                            }
+
+                            if self.model.supports_kv_swap() {
+                                self.offload_inactive_kv_to_cpu();
+                            }
+                        }
+
                         // Attempt eviction before deferring.
                         self.evict_if_needed();
 
@@ -396,13 +431,13 @@ impl InferenceEngine {
                 gpu_used as f64 / (1u64 << 30) as f64,
                 gpu_total as f64 / (1u64 << 30) as f64,
                 gpu_used as f64 / gpu_total as f64 * 100.0,
-                format_bytes_engine(self.tracked_kv_bytes),
+                format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
                 budget_info,
             )
         } else {
             format!(
                 " | kv_cache: {}{}",
-                format_bytes_engine(self.tracked_kv_bytes),
+                format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
                 budget_info
             )
         };
@@ -410,7 +445,7 @@ impl InferenceEngine {
             "Engine stats | uptime={}s | requests: total={} completed={} cancelled={} failed={} | \
              sequences: active={} waiting={} | \
              tokens: prompt={} completion={} | \
-             kv_swaps={} | \
+             kv_swaps={} runtime_offload_ops={} runtime_offload_units={} kv_offload_ops={} kv_offload_tensors={} kv_prefetch_ops={} kv_prefetch_tensors={} | \
              speed: prefill={:.1} tok/s decode={:.1} tok/s{}",
             uptime,
             snap.total_requests,
@@ -422,6 +457,12 @@ impl InferenceEngine {
             snap.total_prompt_tokens,
             snap.total_completion_tokens,
             snap.total_kv_swaps,
+            snap.total_runtime_offload_ops,
+            snap.total_runtime_offload_units,
+            snap.total_kv_offload_ops,
+            snap.total_kv_offload_tensors,
+            snap.total_kv_prefetch_ops,
+            snap.total_kv_prefetch_tensors,
             snap.avg_prefill_tokens_per_sec,
             snap.avg_decode_tokens_per_sec,
             gpu_info,
@@ -444,7 +485,7 @@ impl InferenceEngine {
                 total += sequence::kv_cache_bytes(&seq.kv_caches);
             }
         }
-        self.tracked_kv_bytes = total;
+        self.kv_manager.set_tracked_kv_bytes(total);
     }
 
     /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
@@ -491,13 +532,13 @@ impl InferenceEngine {
         }
 
         // Check 1: tracked KV bytes vs overhead-adjusted budget.
-        if self.tracked_kv_bytes > budget {
+        if self.kv_manager.tracked_kv_bytes() > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
                 warn!(
                     "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
-                    format_bytes_engine(self.tracked_kv_bytes),
+                    format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
                     format_bytes_engine(budget),
                     format_bytes_engine(limit),
                     format_bytes_engine(self.memory_config.baseline_gpu_bytes),
@@ -518,7 +559,7 @@ impl InferenceEngine {
                         "GPU memory hard limit exceeded: gpu_used={} > limit={} (kv_tracked={})",
                         format_bytes_engine(gpu_used),
                         format_bytes_engine(limit),
-                        format_bytes_engine(self.tracked_kv_bytes),
+                        format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
                     );
                 }
                 return true;
@@ -542,7 +583,7 @@ impl InferenceEngine {
             return;
         }
 
-        while self.tracked_kv_bytes > budget && !self.scheduler.running.is_empty() {
+        while self.kv_manager.tracked_kv_bytes() > budget && !self.scheduler.running.is_empty() {
             // Find the running sequence with the most generated tokens (largest KV).
             let victim_id = self
                 .scheduler
@@ -571,7 +612,7 @@ impl InferenceEngine {
             info!(
                 id = %victim_id,
                 freed_bytes = %format_bytes_engine(freed),
-                kv_used = %format_bytes_engine(self.tracked_kv_bytes),
+                kv_used = %format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
                 kv_budget = %format_bytes_engine(budget),
                 "Preempting sequence (KV cache eviction) — will re-prefill later",
             );
@@ -588,9 +629,14 @@ impl InferenceEngine {
                 seq.status = SequenceStatus::Waiting;
                 // Reset tokens to just the prompt to allow re-prefill.
                 seq.tokens.truncate(seq.prompt_len);
+                if let Some(state) = self.request_states.get_mut(&victim_id) {
+                    state.pending_input_ids = seq.tokens.iter().copied().collect();
+                    state.processed_tokens = 0;
+                }
             }
 
-            self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
+            self.kv_manager
+                .set_tracked_kv_bytes(self.kv_manager.tracked_kv_bytes().saturating_sub(freed));
 
             // Move from running back to waiting (back, not front — avoid
             // immediate re-prefill which would cause thrashing).
@@ -612,6 +658,35 @@ impl InferenceEngine {
         // Grant a cooldown period so the cuMemGetInfo hard-safety check
         // doesn't immediately re-trigger (CUDA pool retains freed blocks).
         self.eviction_cooldown = 5;
+    }
+
+    fn offload_inactive_kv_to_cpu(&mut self) {
+        if matches!(self.model.device(), Device::Cpu) {
+            return;
+        }
+
+        let mut offloaded_tensors = 0usize;
+        for (seq_id, seq) in self.sequences.iter_mut() {
+            if self.active_seq_id.as_deref() == Some(seq_id.as_str()) {
+                continue;
+            }
+            offloaded_tensors += self.model.offload_kv_caches(&mut seq.kv_caches);
+        }
+
+        if offloaded_tensors > 0 {
+            self.recount_kv_bytes();
+            self.stats
+                .total_kv_offload_ops
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .total_kv_offload_tensors
+                .fetch_add(offloaded_tensors as u64, Ordering::Relaxed);
+            info!(
+                offloaded_tensors,
+                kv_gpu_used = %format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
+                "Offloaded inactive KV caches to CPU",
+            );
+        }
     }
 
     /// Effective max_tokens for a request, taking server-level max_seq_len into account.
@@ -636,6 +711,9 @@ impl InferenceEngine {
     fn accept_request(&mut self, req: EngineRequest) {
         let prompt_len = req.tokens.len();
         let tokenizer = self.model.tokenizer().clone();
+        let request_id = req.id.clone();
+        let request_tokens = req.tokens.clone();
+        let request_multimodal = req.multimodal_inputs.clone();
 
         // Reject prompts that already exceed max_seq_len.
         if self.memory_config.max_seq_len > 0 && prompt_len > self.memory_config.max_seq_len {
@@ -700,6 +778,15 @@ impl InferenceEngine {
 
         let stream = TokenOutputStream::new(tokenizer);
         self.sequences.insert(req.id.clone(), seq);
+        self.request_states.insert(
+            request_id,
+            runtime::request_state::RequestState {
+                id: req.id.clone(),
+                pending_input_ids: request_tokens.into_iter().collect(),
+                processed_tokens: 0,
+                multimodal_inputs: request_multimodal,
+            },
+        );
         self.token_streams.insert(req.id.clone(), stream);
         self.scheduler.add(req.id);
     }
@@ -757,7 +844,14 @@ impl InferenceEngine {
 
         let (input_ids, start_pos) = {
             let seq = self.sequences.get(&seq_id).unwrap();
-            (seq.next_input_ids().to_vec(), seq.start_pos())
+            let prompt_len = seq.prompt_len;
+            let input_ids = self
+                .request_states
+                .get_mut(&seq_id)
+                .map(|state| state.pop_incremental(prompt_len))
+                .filter(|ids| !ids.is_empty())
+                .unwrap_or_else(|| seq.next_input_ids().to_vec());
+            (input_ids, seq.start_pos())
         };
         let multimodal_inputs = self
             .sequences
@@ -766,6 +860,14 @@ impl InferenceEngine {
             .unwrap_or_default();
 
         let prompt_len = input_ids.len();
+        debug!(
+            id = %seq_id,
+            input_len = prompt_len,
+            start_pos,
+            image_inputs = multimodal_inputs.image_urls.len(),
+            audio_inputs = multimodal_inputs.audio_urls.len(),
+            "Prefill step inputs prepared"
+        );
 
         let logits = match self.model.prefill(RuntimeRequestContext {
             input_ids,
@@ -807,6 +909,9 @@ impl InferenceEngine {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.tokens.push(next_token);
             seq.status = SequenceStatus::Running;
+        }
+        if let Some(state) = self.request_states.get_mut(&seq_id) {
+            state.pending_input_ids.push_back(next_token);
         }
 
         info!(
@@ -861,6 +966,25 @@ impl InferenceEngine {
             .collect();
         if batch.is_empty() {
             return;
+        }
+
+        debug!(batch_size = batch.len(), batch = ?batch, "Starting batched decode");
+
+        if matches!(self.placement_policy, PlacementPolicy::OffloadReady) {
+            let mut prefetched_tensors = 0usize;
+            for seq_id in &batch {
+                if let Some(seq) = self.sequences.get_mut(seq_id) {
+                    prefetched_tensors += self.model.prefetch_kv_caches(&mut seq.kv_caches);
+                }
+            }
+            if prefetched_tensors > 0 {
+                self.stats
+                    .total_kv_prefetch_ops
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .total_kv_prefetch_tensors
+                    .fetch_add(prefetched_tensors as u64, Ordering::Relaxed);
+            }
         }
 
         let batch_size = batch.len();
@@ -1133,6 +1257,8 @@ impl InferenceEngine {
         let t0 = Instant::now();
         let mut total_tokens: u64 = 0;
 
+        debug!(batch_size = batch.len(), batch = ?batch, "Starting sequential decode");
+
         for seq_id in &batch {
             if self
                 .sequences
@@ -1148,13 +1274,21 @@ impl InferenceEngine {
 
             self.swap_in(seq_id);
 
+            debug!(id = %seq_id, "Sequential decode sequence activated");
+
             for _round in 0..self.decode_tokens_per_seq {
                 let (input_ids, start_pos) = {
                     let seq = match self.sequences.get(seq_id) {
                         Some(s) => s,
                         None => break,
                     };
-                    (seq.next_input_ids().to_vec(), seq.start_pos())
+                    let input_ids = self
+                        .request_states
+                        .get_mut(seq_id)
+                        .map(|state| self.input_builder.next_decode_chunk(state))
+                        .filter(|ids| !ids.is_empty())
+                        .unwrap_or_else(|| seq.next_input_ids().to_vec());
+                    (input_ids, seq.start_pos())
                 };
 
                 let logits = match self.model.decode(RuntimeStepContext {
@@ -1181,6 +1315,9 @@ impl InferenceEngine {
 
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
+                }
+                if let Some(state) = self.request_states.get_mut(seq_id) {
+                    state.pending_input_ids.push_back(next_token);
                 }
 
                 total_tokens += 1;
@@ -1244,6 +1381,13 @@ impl InferenceEngine {
             return;
         }
 
+        debug!(
+            next_id = %seq_id,
+            prev_active = ?self.active_seq_id,
+            kv_swap = self.model.supports_kv_swap(),
+            "swap_in begin"
+        );
+
         if !self.model.supports_kv_swap() {
             if self.active_seq_id.as_deref() != Some(seq_id) {
                 self.model.clear_kv_cache();
@@ -1261,11 +1405,22 @@ impl InferenceEngine {
         }
 
         // Load new sequence's KV cache into the model.
-        let caches = self
+        let mut caches = self
             .sequences
             .get(seq_id)
             .map(|s| s.kv_caches.clone())
             .unwrap_or_else(|| vec![None; self.num_layers]);
+        if matches!(self.placement_policy, PlacementPolicy::OffloadReady) {
+            let prefetched_tensors = self.model.prefetch_kv_caches(&mut caches);
+            if prefetched_tensors > 0 {
+                self.stats
+                    .total_kv_prefetch_ops
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .total_kv_prefetch_tensors
+                    .fetch_add(prefetched_tensors as u64, Ordering::Relaxed);
+            }
+        }
         self.model.kv_restore(caches);
         self.active_seq_id = Some(seq_id.to_string());
 
@@ -1273,6 +1428,7 @@ impl InferenceEngine {
         self.stats
             .total_kv_swap_count
             .fetch_add(1, Ordering::Relaxed);
+        debug!(id = %seq_id, "swap_in complete");
     }
 
     /// Mark that the model finished processing `seq_id` for this scheduling
@@ -1296,6 +1452,7 @@ impl InferenceEngine {
             }
         }
         self.recount_kv_bytes();
+        debug!(id = %seq_id, "swap_out complete");
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1399,9 +1556,18 @@ impl InferenceEngine {
         } else {
             0
         };
-        self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
+        self.kv_manager
+            .set_tracked_kv_bytes(self.kv_manager.tracked_kv_bytes().saturating_sub(freed));
+
+        debug!(
+            id = %seq_id,
+            freed_bytes = %format_bytes_engine(freed),
+            tracked_kv_after = %format_bytes_engine(self.kv_manager.tracked_kv_bytes()),
+            "Cleaning up sequence resources"
+        );
 
         self.sequences.remove(seq_id);
+        self.request_states.remove(seq_id);
         self.token_streams.remove(seq_id);
         self.scheduler.remove(seq_id);
 

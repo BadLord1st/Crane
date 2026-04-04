@@ -1,4 +1,4 @@
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 
@@ -10,8 +10,16 @@ pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
         .iter()
         .filter_map(|c| c.as_ref())
         .map(|(k, v)| {
-            let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-            let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+            let k_bytes = if matches!(k.device(), Device::Cpu) {
+                0
+            } else {
+                k.elem_count() as u64 * k.dtype().size_in_bytes() as u64
+            };
+            let v_bytes = if matches!(v.device(), Device::Cpu) {
+                0
+            } else {
+                v.elem_count() as u64 * v.dtype().size_in_bytes() as u64
+            };
             k_bytes + v_bytes
         })
         .sum()

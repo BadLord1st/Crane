@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::engine::types::MultimodalInputs;
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct RequestState {
     pub id: String,
     pub pending_input_ids: VecDeque<u32>,

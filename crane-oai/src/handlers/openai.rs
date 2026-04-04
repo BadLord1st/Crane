@@ -32,24 +32,84 @@ use std::convert::Infallible;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::sse;
 use super::vlm;
 
-fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
-    let d = state.model_spec.sampling_defaults;
-    (d.temperature, d.top_p, d.top_k)
-}
-
-fn effective_include_reasoning(
-    state: &AppState,
-    requested: bool,
-) -> bool {
+fn effective_include_reasoning(state: &AppState, requested: bool) -> bool {
     crate::engine::policies::output_policy::effective_include_reasoning(
         state.model_spec.output_strategy,
         requested,
     )
+}
+
+fn log_sampling_resolution(
+    endpoint: &str,
+    request_id: &str,
+    requested_temperature: Option<f64>,
+    requested_top_p: Option<f64>,
+    requested_top_k: Option<usize>,
+    effective_temperature: Option<f64>,
+    effective_top_p: Option<f64>,
+    effective_top_k: Option<usize>,
+) {
+    let log_one = |name: &str, requested: String, effective: String| {
+        if requested == effective {
+            info!(
+                endpoint,
+                id = %request_id,
+                parameter = name,
+                requested = %requested,
+                effective = %effective,
+                "sampling parameter applied"
+            );
+        } else {
+            info!(
+                endpoint,
+                id = %request_id,
+                "detected {}={} (fallback to {}={})",
+                name,
+                requested,
+                name,
+                effective
+            );
+        }
+    };
+
+    log_one(
+        "temperature",
+        requested_temperature
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+        effective_temperature
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+    );
+    log_one(
+        "top_p",
+        requested_top_p
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+        effective_top_p
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+    );
+    log_one(
+        "top_k",
+        requested_top_k
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".to_string()),
+        effective_top_k
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".to_string()),
+    );
+}
+
+fn log_sampling_notes(endpoint: &str, request_id: &str, notes: &[String]) {
+    for note in notes {
+        info!(endpoint, id = %request_id, "{}", note);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -86,7 +146,26 @@ pub async fn chat_completions(
     if include_reasoning && !req.include_reasoning {
         warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
     }
-    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
+    let sampling = crate::engine::policies::sampling_policy::resolve_sampling(
+        state.model_spec.sampling_defaults,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+    );
+    let temperature = sampling.temperature;
+    let top_p = sampling.top_p;
+    let top_k = sampling.top_k;
+    log_sampling_resolution(
+        "v1/chat/completions",
+        &request_id,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        temperature,
+        top_p,
+        top_k,
+    );
+    log_sampling_notes("v1/chat/completions", &request_id, &sampling.notes);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
         make_error(
@@ -105,9 +184,6 @@ pub async fn chat_completions(
                 include_usage,
                 output_mode,
                 include_reasoning,
-                default_temperature,
-                default_top_p,
-                default_top_k,
             );
             return Ok(Sse::new(stream)
                 .keep_alive(KeepAlive::default())
@@ -136,9 +212,9 @@ pub async fn chat_completions(
                 multimodal_inputs,
                 GenerationParams {
                     max_tokens: req.max_tokens,
-                    temperature: req.temperature.or(default_temperature),
-                    top_p: req.top_p.or(default_top_p),
-                    top_k: req.top_k.or(default_top_k),
+                    temperature,
+                    top_p,
+                    top_k,
                     repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
                     eos_token_id: state.eos_token_id.clone(),
                 },
@@ -201,9 +277,9 @@ pub async fn chat_completions(
                     multimodal_inputs,
                     GenerationParams {
                         max_tokens: req.max_tokens,
-                        temperature: req.temperature.or(default_temperature),
-                        top_p: req.top_p.or(default_top_p),
-                        top_k: req.top_k.or(default_top_k),
+                        temperature,
+                        top_p,
+                        top_k,
                         repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
                         eos_token_id: state.eos_token_id.clone(),
                     },
@@ -318,9 +394,6 @@ fn make_chat_sse_stream_with_tool_runtime(
     include_usage: bool,
     output_mode: crate::gemma4_output::OutputMode,
     include_reasoning: bool,
-    default_temperature: Option<f64>,
-    default_top_p: Option<f64>,
-    default_top_k: Option<usize>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     let created = now_epoch();
 
@@ -394,6 +467,30 @@ fn make_chat_sse_stream_with_tool_runtime(
                 yield Ok(Event::default().data("[DONE]"));
                 return;
             };
+            let sampling = crate::engine::policies::sampling_policy::resolve_sampling(
+                state.model_spec.sampling_defaults,
+                req.temperature,
+                req.top_p,
+                req.top_k,
+            );
+            let temperature = sampling.temperature;
+            let top_p = sampling.top_p;
+            let top_k = sampling.top_k;
+            log_sampling_resolution(
+                "v1/chat/completions(stream-tool-runtime)",
+                &request_id,
+                req.temperature,
+                req.top_p,
+                req.top_k,
+                temperature,
+                top_p,
+                top_k,
+            );
+            log_sampling_notes(
+                "v1/chat/completions(stream-tool-runtime)",
+                &request_id,
+                &sampling.notes,
+            );
 
             let response_rx = match engine.submit_with_multimodal(
                 request_id.clone(),
@@ -401,9 +498,9 @@ fn make_chat_sse_stream_with_tool_runtime(
                 multimodal_inputs,
                 GenerationParams {
                     max_tokens: req.max_tokens,
-                    temperature: req.temperature.or(default_temperature),
-                    top_p: req.top_p.or(default_top_p),
-                    top_k: req.top_k.or(default_top_k),
+                    temperature,
+                    top_p,
+                    top_k,
                     repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
                     eos_token_id: state.eos_token_id.clone(),
                 },
@@ -616,7 +713,26 @@ pub async fn completions(
     if include_reasoning && !req.include_reasoning {
         warn!("Gemma4: include_reasoning=false requested, forcing reasoning=true");
     }
-    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
+    let sampling = crate::engine::policies::sampling_policy::resolve_sampling(
+        state.model_spec.sampling_defaults,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+    );
+    let temperature = sampling.temperature;
+    let top_p = sampling.top_p;
+    let top_k = sampling.top_k;
+    log_sampling_resolution(
+        "v1/completions",
+        &request_id,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        temperature,
+        top_p,
+        top_k,
+    );
+    log_sampling_notes("v1/completions", &request_id, &sampling.notes);
 
     let engine = state.engine.as_ref().ok_or_else(|| {
         make_error(
@@ -631,9 +747,9 @@ pub async fn completions(
             input_ids,
             GenerationParams {
                 max_tokens: req.max_tokens,
-                temperature: req.temperature.or(default_temperature),
-                top_p: req.top_p.or(default_top_p),
-                top_k: req.top_k.or(default_top_k),
+                temperature,
+                top_p,
+                top_k,
                 repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
                 eos_token_id: state.eos_token_id.clone(),
             },
@@ -884,10 +1000,7 @@ fn is_tool_runtime_enabled(req: &ChatCompletionRequest, declared_tools: &[ToolSp
     if declared_tools.is_empty() {
         return false;
     }
-    match &req.tool_choice {
-        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none") => false,
-        _ => true,
-    }
+    !matches!(&req.tool_choice, Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("none"))
 }
 
 fn requested_tool_name(req: &ChatCompletionRequest) -> Option<String> {
@@ -1086,7 +1199,7 @@ async fn exec_command_tool(name: &str, command: &str, args: &Value) -> Value {
         "ok": output.status.success(),
         "tool": name,
         "status": output.status.code(),
-        "stdout": parsed.unwrap_or_else(|| Value::String(stdout)),
+        "stdout": parsed.unwrap_or(Value::String(stdout)),
         "stderr": stderr,
     })
 }

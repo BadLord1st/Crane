@@ -51,11 +51,7 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file()
-                    && p.extension()
-                        .map(|e| e == "gguf")
-                        .unwrap_or(false)
-                {
+                if p.is_file() && p.extension().map(|e| e == "gguf").unwrap_or(false) {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
@@ -86,6 +82,10 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
+        // SAFETY: candle requires `unsafe` for mmap-backed safetensors loading.
+        // The mapped files come from the model directory we just resolved, and
+        // `filenames` live for the duration of this call while `VarBuilder`
+        // takes ownership of the mapping handles internally.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
@@ -238,11 +238,8 @@ impl Model {
     }
 
     pub fn warmup(&mut self) {
-        if let Err(e) = self.generate(
-            &[45, 546, 456],
-            &GenerationConfig::with_max_tokens(5),
-            None,
-        ) {
+        if let Err(e) = self.generate(&[45, 546, 456], &GenerationConfig::with_max_tokens(5), None)
+        {
             eprintln!("warmup failed (non-fatal): {e}");
         }
         self.clear_kv_cache();

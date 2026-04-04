@@ -14,6 +14,12 @@ pub struct EngineStats {
     pub total_decode_steps: AtomicU64,
     pub total_decode_time_us: AtomicU64,
     pub total_kv_swap_count: AtomicU64,
+    pub total_runtime_offload_ops: AtomicU64,
+    pub total_runtime_offload_units: AtomicU64,
+    pub total_kv_offload_ops: AtomicU64,
+    pub total_kv_offload_tensors: AtomicU64,
+    pub total_kv_prefetch_ops: AtomicU64,
+    pub total_kv_prefetch_tensors: AtomicU64,
     pub active_sequences: AtomicU64,
     pub waiting_sequences: AtomicU64,
 }
@@ -31,6 +37,12 @@ impl EngineStats {
             total_decode_steps: AtomicU64::new(0),
             total_decode_time_us: AtomicU64::new(0),
             total_kv_swap_count: AtomicU64::new(0),
+            total_runtime_offload_ops: AtomicU64::new(0),
+            total_runtime_offload_units: AtomicU64::new(0),
+            total_kv_offload_ops: AtomicU64::new(0),
+            total_kv_offload_tensors: AtomicU64::new(0),
+            total_kv_prefetch_ops: AtomicU64::new(0),
+            total_kv_prefetch_tensors: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             waiting_sequences: AtomicU64::new(0),
         }
@@ -62,6 +74,12 @@ impl EngineStats {
             active_sequences: self.active_sequences.load(Ordering::Relaxed),
             waiting_sequences: self.waiting_sequences.load(Ordering::Relaxed),
             total_kv_swaps: self.total_kv_swap_count.load(Ordering::Relaxed),
+            total_runtime_offload_ops: self.total_runtime_offload_ops.load(Ordering::Relaxed),
+            total_runtime_offload_units: self.total_runtime_offload_units.load(Ordering::Relaxed),
+            total_kv_offload_ops: self.total_kv_offload_ops.load(Ordering::Relaxed),
+            total_kv_offload_tensors: self.total_kv_offload_tensors.load(Ordering::Relaxed),
+            total_kv_prefetch_ops: self.total_kv_prefetch_ops.load(Ordering::Relaxed),
+            total_kv_prefetch_tensors: self.total_kv_prefetch_tensors.load(Ordering::Relaxed),
             avg_decode_tokens_per_sec: avg_decode_tok_s,
             avg_prefill_tokens_per_sec: avg_prefill_tok_s,
         }
@@ -79,6 +97,12 @@ pub struct StatsSnapshot {
     pub active_sequences: u64,
     pub waiting_sequences: u64,
     pub total_kv_swaps: u64,
+    pub total_runtime_offload_ops: u64,
+    pub total_runtime_offload_units: u64,
+    pub total_kv_offload_ops: u64,
+    pub total_kv_offload_tensors: u64,
+    pub total_kv_prefetch_ops: u64,
+    pub total_kv_prefetch_tensors: u64,
     pub avg_decode_tokens_per_sec: f64,
     pub avg_prefill_tokens_per_sec: f64,
 }
@@ -101,6 +125,12 @@ mod tests {
         assert_eq!(s.total_decode_steps.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_time_us.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_kv_swap_count.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_runtime_offload_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_runtime_offload_units.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_kv_offload_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_kv_offload_tensors.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_kv_prefetch_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_kv_prefetch_tensors.load(Ordering::Relaxed), 0);
         assert_eq!(s.active_sequences.load(Ordering::Relaxed), 0);
         assert_eq!(s.waiting_sequences.load(Ordering::Relaxed), 0);
     }
@@ -115,6 +145,12 @@ mod tests {
         s.total_prompt_tokens.store(500, Ordering::Relaxed);
         s.total_completion_tokens.store(1000, Ordering::Relaxed);
         s.total_kv_swap_count.store(3, Ordering::Relaxed);
+        s.total_runtime_offload_ops.store(2, Ordering::Relaxed);
+        s.total_runtime_offload_units.store(8, Ordering::Relaxed);
+        s.total_kv_offload_ops.store(4, Ordering::Relaxed);
+        s.total_kv_offload_tensors.store(40, Ordering::Relaxed);
+        s.total_kv_prefetch_ops.store(6, Ordering::Relaxed);
+        s.total_kv_prefetch_tensors.store(60, Ordering::Relaxed);
         s.active_sequences.store(4, Ordering::Relaxed);
         s.waiting_sequences.store(2, Ordering::Relaxed);
 
@@ -126,6 +162,12 @@ mod tests {
         assert_eq!(snap.total_prompt_tokens, 500);
         assert_eq!(snap.total_completion_tokens, 1000);
         assert_eq!(snap.total_kv_swaps, 3);
+        assert_eq!(snap.total_runtime_offload_ops, 2);
+        assert_eq!(snap.total_runtime_offload_units, 8);
+        assert_eq!(snap.total_kv_offload_ops, 4);
+        assert_eq!(snap.total_kv_offload_tensors, 40);
+        assert_eq!(snap.total_kv_prefetch_ops, 6);
+        assert_eq!(snap.total_kv_prefetch_tensors, 60);
         assert_eq!(snap.active_sequences, 4);
         assert_eq!(snap.waiting_sequences, 2);
     }

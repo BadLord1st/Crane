@@ -5,6 +5,7 @@
 //! * `POST /generate`       — native text generation
 //! * `GET  /model_info`     — model metadata
 //! * `GET  /server_info`    — server configuration + live stats
+//! * `GET  /engine_info`    — runtime capabilities + policies
 //! * `POST /flush_cache`    — flush KV caches
 //! * `POST /abort_request`  — cancel in-flight request
 //! * `GET  /health_generate` — deep health check (runs 1-token generation)
@@ -184,14 +185,54 @@ pub struct ServerInfoResponse {
     pub version: String,
     pub model_path: String,
     pub model_type: String,
+    pub placement_policy: String,
     pub host: String,
     pub port: u16,
     pub max_concurrent: usize,
     pub decode_tokens_per_seq: usize,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
+    /// Number of runtime-managed offload operations under memory pressure.
+    pub runtime_offload_ops: u64,
+    /// Number of runtime-managed units offloaded under memory pressure.
+    pub runtime_offload_units: u64,
+    /// Number of CPU offload operations performed for KV caches.
+    pub kv_offload_ops: u64,
+    /// Number of KV tensors moved from model device to CPU.
+    pub kv_offload_tensors: u64,
+    /// Number of KV prefetch operations performed back to model device.
+    pub kv_prefetch_ops: u64,
+    /// Number of KV tensors moved from CPU back to model device.
+    pub kv_prefetch_tensors: u64,
     /// Live engine statistics snapshot.
     pub stats: crate::engine::StatsSnapshot,
+}
+
+// ═════════════════════════════════════════════════════════════
+//  /engine_info
+// ═════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineCapabilitiesResponse {
+    pub text: bool,
+    pub multimodal: bool,
+    pub tool_call_tokens: bool,
+    pub batch_decode: bool,
+    pub kv_swap: bool,
+    pub accepts_image_inputs: bool,
+    pub accepts_audio_inputs: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineInfoResponse {
+    pub placement_policy: String,
+    pub chat_format_strategy: String,
+    pub output_strategy: String,
+    pub supports_batch_decode: bool,
+    pub supports_kv_swap: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_swap_unavailable_reason: Option<String>,
+    pub capabilities: EngineCapabilitiesResponse,
 }
 
 // ═════════════════════════════════════════════════════════════

@@ -202,6 +202,7 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ToolFunctionSpec {
     pub name: String,
     #[serde(default)]

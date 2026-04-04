@@ -211,11 +211,8 @@ pub async fn vlm_chat_completions(
             };
             yield Ok::<_, std::convert::Infallible>(Event::default().json_data(&first_chunk).unwrap());
 
-            let mut completion_tokens = 0usize;
-
             // Stream tokens.
             while let Some(text) = rx.recv().await {
-                completion_tokens += 1;
                 let chunk = ChatCompletionChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk".into(),

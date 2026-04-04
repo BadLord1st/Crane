@@ -9,7 +9,7 @@ use std::io::Write;
 use anyhow::{Error as E, Result};
 
 use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
-use candle_transformers::models::qwen2_moe::{Model as ModelMoe};
+use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -123,6 +123,7 @@ pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     model_typed: ModelTyped,
+    num_layers: usize,
 }
 
 pub enum ModelTyped {
@@ -159,6 +160,10 @@ impl Model {
         self.forward(&input, start_pos)
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
     fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
@@ -168,18 +173,39 @@ impl Model {
 
         let filenames = utils::get_safetensors_files(model_path)?;
 
+        // SAFETY: candle requires `unsafe` for mmap-backed safetensors loading.
+        // The mapped files come from the model directory we just resolved, and
+        // `filenames` live for the duration of this call while `VarBuilder`
+        // takes ownership of the mapping handles internally.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
-        let config: ConfigBase = serde_json::from_slice(&config_data)?;
+        let config_json: serde_json::Value = serde_json::from_slice(&config_data)?;
 
-        let model_typed = ModelTyped::Base(ModelBase::new(&config, vb)?);
+        let num_layers = config_json
+            .get("num_hidden_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let has_moe = config_json
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0;
+
+        let model_typed = if has_moe {
+            let config: ConfigMoe = serde_json::from_value(config_json)?;
+            ModelTyped::Moe(ModelMoe::new(&config, vb)?)
+        } else {
+            let config: ConfigBase = serde_json::from_value(config_json)?;
+            ModelTyped::Base(ModelBase::new(&config, vb)?)
+        };
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
             model_typed,
+            num_layers,
         })
     }
 

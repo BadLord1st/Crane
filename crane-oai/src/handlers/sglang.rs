@@ -4,11 +4,13 @@
 //! - `POST /generate`        — native text generation
 //! - `GET  /model_info`      — model metadata
 //! - `GET  /server_info`     — server configuration + live stats
+//! - `GET  /engine_info`     — runtime capabilities + policies
 //! - `GET  /health_generate` — deep health check (1-token probe)
 //! - `POST /flush_cache`     — flush model KV caches (no-op informational)
 //! - `POST /abort_request`   — abort in-flight request (informational)
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::State,
@@ -19,7 +21,9 @@ use axum::{
     },
 };
 use serde_json::json;
+use tracing::{info, warn};
 
+use crate::engine::runtime::{ChatFormatStrategy, OutputStrategy};
 use crate::engine::{types::GenerationParams, types::MultimodalInputs, EngineResponse};
 use crate::openai_api::ErrorResponse;
 use crate::sglang_api::*;
@@ -28,9 +32,65 @@ use crate::{make_error, AppState};
 use super::sse;
 use super::vlm;
 
-fn default_sampling_for_state(state: &AppState) -> (Option<f64>, Option<f64>, Option<usize>) {
-    let d = state.model_spec.sampling_defaults;
-    (d.temperature, d.top_p, d.top_k)
+fn log_sampling_resolution(
+    request_id: &str,
+    requested_temperature: Option<f64>,
+    requested_top_p: Option<f64>,
+    requested_top_k: Option<usize>,
+    effective_temperature: Option<f64>,
+    effective_top_p: Option<f64>,
+    effective_top_k: Option<usize>,
+) {
+    let log_one = |name: &str, requested: String, effective: String| {
+        if requested == effective {
+            info!(
+                endpoint = "generate",
+                id = %request_id,
+                parameter = name,
+                requested = %requested,
+                effective = %effective,
+                "sampling parameter applied"
+            );
+        } else {
+            info!(
+                endpoint = "generate",
+                id = %request_id,
+                "detected {}={} (fallback to {}={})",
+                name,
+                requested,
+                name,
+                effective
+            );
+        }
+    };
+
+    log_one(
+        "temperature",
+        requested_temperature
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+        effective_temperature
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+    );
+    log_one(
+        "top_p",
+        requested_top_p
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+        effective_top_p
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "None".to_string()),
+    );
+    log_one(
+        "top_k",
+        requested_top_k
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".to_string()),
+        effective_top_k
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".to_string()),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -45,21 +105,24 @@ pub async fn generate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let req_t0 = Instant::now();
+
     // If VLM model is loaded, delegate to VLM handler.
     if state.vlm_tx.is_some() {
         return vlm::vlm_generate(state, req).await;
     }
 
     // Resolve input tokens.
-    let input_ids = if let Some(ids) = req.input_ids {
-        ids
+    let (input_ids, input_source) = if let Some(ids) = req.input_ids {
+        (ids, "input_ids")
     } else if let Some(text) = &req.text {
-        state
+        let ids = state
             .tokenizer
             .encode(text.as_str(), true)
             .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
             .get_ids()
-            .to_vec()
+            .to_vec();
+        (ids, "text")
     } else {
         return Err(make_error(
             StatusCode::BAD_REQUEST,
@@ -68,10 +131,30 @@ pub async fn generate(
     };
 
     let sp = &req.sampling_params;
-    let (default_temperature, default_top_p, default_top_k) = default_sampling_for_state(&state);
+    let sampling = crate::engine::policies::sampling_policy::resolve_sampling(
+        state.model_spec.sampling_defaults,
+        sp.temperature,
+        sp.top_p,
+        sp.top_k,
+    );
+    let temperature = sampling.temperature;
+    let top_p = sampling.top_p;
+    let top_k = sampling.top_k;
     let request_id = req
         .rid
         .unwrap_or_else(|| format!("gen-{}", uuid::Uuid::new_v4()));
+    log_sampling_resolution(
+        &request_id,
+        sp.temperature,
+        sp.top_p,
+        sp.top_k,
+        temperature,
+        top_p,
+        top_k,
+    );
+    for note in &sampling.notes {
+        info!(endpoint = "generate", id = %request_id, "{}", note);
+    }
     let multimodal_inputs = req
         .image_url
         .clone()
@@ -82,11 +165,31 @@ pub async fn generate(
         .unwrap_or_default();
 
     if !multimodal_inputs.image_urls.is_empty() && !state.accepts_image_inputs {
+        warn!(
+            id = %request_id,
+            image_count = multimodal_inputs.image_urls.len(),
+            "Rejected request: image inputs are not supported by loaded model"
+        );
         return Err(make_error(
             StatusCode::BAD_REQUEST,
             "Loaded model does not support image inputs",
         ));
     }
+
+    info!(
+        id = %request_id,
+        stream = req.stream,
+        input_source,
+        input_tokens = input_ids.len(),
+        image_inputs = multimodal_inputs.image_urls.len(),
+        max_new_tokens = sp.max_new_tokens,
+        temperature = ?temperature,
+        top_p = ?top_p,
+        top_k = ?top_k,
+        repetition_penalty = sp.repetition_penalty,
+        "SGLang generate request accepted"
+    );
+    info!(id = %request_id, elapsed_ms = req_t0.elapsed().as_millis(), "Request pre-processing complete");
 
     let engine = state.engine.as_ref().ok_or_else(|| {
         make_error(
@@ -95,6 +198,7 @@ pub async fn generate(
         )
     })?;
 
+    let submit_t0 = Instant::now();
     let response_rx = engine
         .submit_with_multimodal(
             request_id.clone(),
@@ -102,31 +206,46 @@ pub async fn generate(
             multimodal_inputs,
             GenerationParams {
                 max_tokens: sp.max_new_tokens,
-                temperature: sp.temperature.or(default_temperature),
-                top_p: sp.top_p.or(default_top_p),
-                top_k: sp.top_k.or(default_top_k),
+                temperature,
+                top_p,
+                top_k,
                 repetition_penalty: sp.repetition_penalty,
                 eos_token_id: state.eos_token_id.clone(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
+    info!(
+        id = %request_id,
+        submit_ms = submit_t0.elapsed().as_millis(),
+        "Engine request submitted"
+    );
 
     if req.stream {
+        info!(
+            id = %request_id,
+            elapsed_ms = req_t0.elapsed().as_millis(),
+            "Starting streaming response"
+        );
         let stream = sse::make_generate_sse_stream(request_id, response_rx);
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         // Collect full response.
+        let collect_t0 = Instant::now();
         let mut full_text = String::new();
         let mut prompt_tokens = 0usize;
         let mut completion_tokens = 0usize;
         let mut finish_reason = "length".to_string();
+        let mut token_chunks = 0usize;
 
         let mut response_rx = response_rx;
         while let Some(resp) = response_rx.recv().await {
             match resp {
-                EngineResponse::Token { text, .. } => full_text.push_str(&text),
+                EngineResponse::Token { text, .. } => {
+                    token_chunks += 1;
+                    full_text.push_str(&text)
+                }
                 EngineResponse::Finished {
                     full_text: ft,
                     prompt_tokens: pt,
@@ -140,10 +259,28 @@ pub async fn generate(
                     break;
                 }
                 EngineResponse::Error(e) => {
+                    warn!(
+                        id = %request_id,
+                        error = %e,
+                        elapsed_ms = req_t0.elapsed().as_millis(),
+                        "Generation failed"
+                    );
                     return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, &e));
                 }
             }
         }
+
+        info!(
+            id = %request_id,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason = %finish_reason,
+            token_chunks,
+            output_chars = full_text.chars().count(),
+            collect_ms = collect_t0.elapsed().as_millis(),
+            total_ms = req_t0.elapsed().as_millis(),
+            "Generation finished"
+        );
 
         let response = GenerateResponse {
             text: full_text,
@@ -192,13 +329,73 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
         version: env!("CARGO_PKG_VERSION").to_string(),
         model_path: state.model_path.clone(),
         model_type: state.model_type_name.clone(),
+        placement_policy: state.placement_policy.clone(),
         host: state.host.clone(),
         port: state.port,
         max_concurrent: state.max_concurrent,
         decode_tokens_per_seq: state.decode_tokens_per_seq,
         max_seq_len: state.max_seq_len,
         gpu_memory_limit: state.gpu_memory_limit.clone(),
+        runtime_offload_ops: stats.total_runtime_offload_ops,
+        runtime_offload_units: stats.total_runtime_offload_units,
+        kv_offload_ops: stats.total_kv_offload_ops,
+        kv_offload_tensors: stats.total_kv_offload_tensors,
+        kv_prefetch_ops: stats.total_kv_prefetch_ops,
+        kv_prefetch_tensors: stats.total_kv_prefetch_tensors,
         stats,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────
+//  /engine_info
+// ─────────────────────────────────────────────────────────────
+
+/// `GET /engine_info` — runtime capabilities + policies.
+pub async fn engine_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let chat_format_strategy = match state.model_spec.chat_format_strategy {
+        ChatFormatStrategy::AutoJinja => "auto_jinja",
+        ChatFormatStrategy::Hunyuan => "hunyuan",
+        ChatFormatStrategy::Gemma4 => "gemma4",
+    }
+    .to_string();
+
+    let output_strategy = match state.model_spec.output_strategy {
+        OutputStrategy::Plain => "plain",
+        OutputStrategy::Gemma4 => "gemma4",
+    }
+    .to_string();
+
+    let caps = state.model_spec.capabilities;
+    let supports_kv_swap = state.model_spec.supports_kv_swap();
+    let kv_swap_unavailable_reason = if supports_kv_swap {
+        None
+    } else {
+        let reason = if state.model_type_name == "qwen25" {
+            "KV swap unavailable: current qwen2/qwen2_moe backend in candle_transformers does not expose public KV get/set APIs"
+        } else if state.model_type_name == "gemma4" {
+            "KV swap unavailable: engine auto-detects memory pressure, but current Gemma4 backend does not yet expose KV/expert offload targets"
+        } else {
+            "KV swap unavailable for this model runtime backend"
+        };
+        Some(reason.to_string())
+    };
+
+    Json(EngineInfoResponse {
+        placement_policy: state.placement_policy.clone(),
+        chat_format_strategy,
+        output_strategy,
+        supports_batch_decode: state.model_spec.supports_batch_decode(),
+        supports_kv_swap,
+        kv_swap_unavailable_reason,
+        capabilities: EngineCapabilitiesResponse {
+            text: caps.text,
+            multimodal: caps.multimodal,
+            tool_call_tokens: caps.tool_call_tokens,
+            batch_decode: caps.batch_decode,
+            kv_swap: caps.kv_swap,
+            accepts_image_inputs: caps.accepts_image_inputs,
+            accepts_audio_inputs: caps.accepts_audio_inputs,
+        },
     })
 }
 
