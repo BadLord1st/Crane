@@ -372,8 +372,6 @@ pub async fn engine_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
     } else {
         let reason = if state.model_type_name == "qwen25" {
             "KV swap unavailable: current qwen2/qwen2_moe backend in candle_transformers does not expose public KV get/set APIs"
-        } else if state.model_type_name == "gemma4" {
-            "KV swap unavailable: engine auto-detects memory pressure, but current Gemma4 backend does not yet expose KV/expert offload targets"
         } else {
             "KV swap unavailable for this model runtime backend"
         };
@@ -395,6 +393,9 @@ pub async fn engine_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
             kv_swap: caps.kv_swap,
             accepts_image_inputs: caps.accepts_image_inputs,
             accepts_audio_inputs: caps.accepts_audio_inputs,
+            moe_enabled: caps.moe_enabled,
+            moe_num_experts: caps.moe_num_experts,
+            moe_top_k_experts: caps.moe_top_k_experts,
         },
     })
 }

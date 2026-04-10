@@ -7,6 +7,9 @@ pub struct ModelCapabilities {
     pub kv_swap: bool,
     pub accepts_image_inputs: bool,
     pub accepts_audio_inputs: bool,
+    pub moe_enabled: bool,
+    pub moe_num_experts: Option<usize>,
+    pub moe_top_k_experts: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

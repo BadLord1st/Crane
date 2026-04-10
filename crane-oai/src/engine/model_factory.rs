@@ -87,6 +87,9 @@ pub enum ModelFormat {
 pub struct ModelCapabilities {
     pub accepts_image_inputs: bool,
     pub accepts_audio_inputs: bool,
+    pub moe_enabled: bool,
+    pub moe_num_experts: Option<usize>,
+    pub moe_top_k_experts: Option<usize>,
 }
 
 fn value_has_any_key(v: &Value, keys: &[&str]) -> bool {
@@ -148,6 +151,22 @@ fn detect_gemma4_capabilities(model_path: &str) -> ModelCapabilities {
             );
             caps.accepts_image_inputs |= top_image || nested_image;
             caps.accepts_audio_inputs |= top_audio || nested_audio;
+
+            let moe_enabled = cfg
+                .get("enable_moe_block")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            caps.moe_enabled = moe_enabled;
+            if moe_enabled {
+                caps.moe_num_experts = cfg
+                    .get("num_experts")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok());
+                caps.moe_top_k_experts = cfg
+                    .get("top_k_experts")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok());
+            }
         }
     }
 
@@ -172,6 +191,9 @@ pub fn detect_model_capabilities(model_type: ModelType, model_path: &str) -> Mod
         ModelType::PaddleOcrVl => ModelCapabilities {
             accepts_image_inputs: true,
             accepts_audio_inputs: false,
+            moe_enabled: false,
+            moe_num_experts: None,
+            moe_top_k_experts: None,
         },
         ModelType::Gemma4 => detect_gemma4_capabilities(model_path),
         _ => ModelCapabilities::default(),
@@ -193,6 +215,9 @@ pub fn create_model_spec(model_type: ModelType, model_path: &str) -> ModelSpec {
         ),
         accepts_image_inputs: base_caps.accepts_image_inputs,
         accepts_audio_inputs: base_caps.accepts_audio_inputs,
+        moe_enabled: base_caps.moe_enabled,
+        moe_num_experts: base_caps.moe_num_experts,
+        moe_top_k_experts: base_caps.moe_top_k_experts,
     };
 
     let (chat_format_strategy, output_strategy, sampling_defaults) = match resolved {

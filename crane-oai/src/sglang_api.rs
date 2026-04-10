@@ -221,6 +221,11 @@ pub struct EngineCapabilitiesResponse {
     pub kv_swap: bool,
     pub accepts_image_inputs: bool,
     pub accepts_audio_inputs: bool,
+    pub moe_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_num_experts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_top_k_experts: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
