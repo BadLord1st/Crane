@@ -40,6 +40,7 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
+    pub num_global_key_value_heads: Option<usize>,
     pub rms_norm_eps: f64,
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
@@ -94,6 +95,15 @@ impl Config {
             self.head_dim
         } else {
             self.global_head_dim.unwrap_or(self.head_dim)
+        }
+    }
+
+    pub fn num_kv_heads_for_layer(&self, layer_idx: usize) -> usize {
+        if self.is_sliding_layer(layer_idx) {
+            self.num_key_value_heads
+        } else {
+            self.num_global_key_value_heads
+                .unwrap_or(self.num_key_value_heads)
         }
     }
 
@@ -498,7 +508,12 @@ impl Attention {
     fn new(cfg: &Config, layer_idx: usize, vb: VarBuilder) -> candle_core::Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_heads = cfg.num_kv_heads_for_layer(layer_idx);
+        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+            candle_core::bail!(
+                "invalid Gemma4 heads config at layer {layer_idx}: num_attention_heads={num_heads}, num_kv_heads={num_kv_heads}"
+            );
+        }
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = cfg.head_dim_for_layer(layer_idx);
         let bias = cfg.attention_bias;
