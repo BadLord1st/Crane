@@ -276,6 +276,20 @@ impl Module for MLP {
 }
 
 #[derive(Debug, Clone)]
+struct ExpertDispatchPlan {
+    token_ids: Vec<u32>,
+    weight_positions: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct Gemma4RoutingPlan {
+    topk_weights: Tensor,
+    per_expert: Vec<ExpertDispatchPlan>,
+    num_tokens: usize,
+    top_k_experts: usize,
+}
+
+#[derive(Debug, Clone)]
 struct Gemma4TextRouter {
     proj: Linear,
     scale: Tensor,
@@ -307,7 +321,7 @@ impl Gemma4TextRouter {
         })
     }
 
-    fn route(&self, hidden_states: &Tensor) -> candle_core::Result<Vec<Vec<(usize, f32)>>> {
+    fn route(&self, hidden_states: &Tensor) -> candle_core::Result<Gemma4RoutingPlan> {
         let x_dtype = hidden_states.dtype();
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
@@ -327,7 +341,21 @@ impl Gemma4TextRouter {
         let (num_tokens, num_experts) = probs.dims2()?;
         let k = self.top_k_experts.min(num_experts);
         if k == 0 {
-            return Ok(vec![Vec::new(); num_tokens]);
+            return Ok(Gemma4RoutingPlan {
+                topk_weights: Tensor::zeros(
+                    (num_tokens, 0),
+                    hidden_states.dtype(),
+                    hidden_states.device(),
+                )?,
+                per_expert: (0..num_experts)
+                    .map(|_| ExpertDispatchPlan {
+                        token_ids: Vec::new(),
+                        weight_positions: Vec::new(),
+                    })
+                    .collect(),
+                num_tokens,
+                top_k_experts: 0,
+            });
         }
 
         // Device-side top-k indices and probs.
@@ -347,25 +375,33 @@ impl Gemma4TextRouter {
         let topk_scales = scale_2d.gather(&topk_idx, D::Minus1)?;
         let topk_weights = topk_norm.broadcast_mul(&topk_scales)?;
 
-        // Only move compact [num_tokens, k] tensors to CPU.
+        // Only move compact [num_tokens, k] indices to CPU; keep routing weights on device
+        // so the expert path can reuse them without rebuilding/uploading per-expert tensors.
         let idx_cpu = topk_idx
             .to_dtype(DType::U32)?
             .to_device(&Device::Cpu)?
             .to_vec2::<u32>()?;
-        let w_cpu = topk_weights
-            .to_dtype(DType::F32)?
-            .to_device(&Device::Cpu)?
-            .to_vec2::<f32>()?;
 
-        let mut routes = Vec::with_capacity(num_tokens);
-        for (idx_row, w_row) in idx_cpu.into_iter().zip(w_cpu.into_iter()) {
-            let mut row = Vec::with_capacity(k);
-            for (expert_idx, weight) in idx_row.into_iter().zip(w_row.into_iter()) {
-                row.push((expert_idx as usize, weight));
+        let mut per_expert = (0..num_experts)
+            .map(|_| ExpertDispatchPlan {
+                token_ids: Vec::new(),
+                weight_positions: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        for (token_idx, idx_row) in idx_cpu.into_iter().enumerate() {
+            for (route_slot, expert_idx) in idx_row.into_iter().enumerate() {
+                let plan = &mut per_expert[expert_idx as usize];
+                plan.token_ids.push(token_idx as u32);
+                plan.weight_positions
+                    .push((token_idx * k + route_slot) as u32);
             }
-            routes.push(row);
         }
-        Ok(routes)
+        Ok(Gemma4RoutingPlan {
+            topk_weights,
+            per_expert,
+            num_tokens,
+            top_k_experts: k,
+        })
     }
 }
 
@@ -430,11 +466,15 @@ impl Gemma4TextExperts {
     fn forward(
         &mut self,
         hidden_states: &Tensor,
-        routes: &[Vec<(usize, f32)>],
+        routes: &Gemma4RoutingPlan,
     ) -> candle_core::Result<Tensor> {
         let (num_tokens, hidden_size) = hidden_states.dims2()?;
-        if routes.len() != num_tokens {
-            candle_core::bail!("routes/token mismatch: {} vs {}", routes.len(), num_tokens)
+        if routes.num_tokens != num_tokens {
+            candle_core::bail!(
+                "routes/token mismatch: {} vs {}",
+                routes.num_tokens,
+                num_tokens
+            )
         }
 
         let mut outputs = Tensor::zeros(
@@ -442,24 +482,13 @@ impl Gemma4TextExperts {
             hidden_states.dtype(),
             hidden_states.device(),
         )?;
-
-        // Group token contributions by expert to run larger matmuls.
-        let mut per_expert: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
-        for (token_idx, token_routes) in routes.iter().enumerate() {
-            for (expert_idx, weight) in token_routes {
-                if *weight == 0.0 {
-                    continue;
-                }
-                per_expert
-                    .entry(*expert_idx)
-                    .or_default()
-                    .push((token_idx, *weight));
-            }
-        }
+        let routing_weights = routes
+            .topk_weights
+            .reshape(routes.num_tokens * routes.top_k_experts)?;
 
         let mut expert_cache: HashMap<usize, (Tensor, Tensor)> = HashMap::new();
-        for (expert_idx, assignments) in per_expert {
-            if assignments.is_empty() {
+        for (expert_idx, assignments) in routes.per_expert.iter().enumerate() {
+            if assignments.token_ids.is_empty() {
                 continue;
             }
 
@@ -478,8 +507,8 @@ impl Gemma4TextExperts {
             }
             let (gate_up, down) = expert_cache.get(&expert_idx).unwrap();
 
-            let token_ids: Vec<u32> = assignments.iter().map(|(idx, _)| *idx as u32).collect();
-            let token_idx_t = Tensor::new(token_ids.as_slice(), hidden_states.device())?;
+            let token_idx_t =
+                Tensor::new(assignments.token_ids.as_slice(), hidden_states.device())?;
             let expert_in = hidden_states.index_select(&token_idx_t, 0)?;
 
             let gate_up_t = gate_up.transpose(0, 1)?;
@@ -492,8 +521,14 @@ impl Gemma4TextExperts {
             let hidden = (gate.apply(&self.act_fn)? * up)?;
             let mut expert_out = hidden.matmul(&down_t)?;
 
-            let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
-            let weights_t = Self::routing_weights_tensor(weights.as_slice(), &expert_out)?;
+            let weight_idx_t = Tensor::new(
+                assignments.weight_positions.as_slice(),
+                hidden_states.device(),
+            )?;
+            let weights_t = routing_weights
+                .index_select(&weight_idx_t, 0)?
+                .reshape((assignments.weight_positions.len(), 1))?
+                .to_dtype(expert_out.dtype())?;
             expert_out = expert_out.broadcast_mul(&weights_t)?;
 
             outputs = outputs.index_add(&token_idx_t, &expert_out, 0)?;
@@ -894,20 +929,26 @@ mod tests {
         .expect("hidden states");
 
         let routes = router.route(&hidden_states).expect("route should succeed");
+        let weights = routes
+            .topk_weights
+            .to_dtype(DType::F32)
+            .expect("weights dtype")
+            .to_vec2::<f32>()
+            .expect("weights vec");
 
-        assert_eq!(routes.len(), 2);
-        assert_eq!(
-            routes[0].iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert_eq!(
-            routes[1].iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
-            vec![2, 1]
-        );
-        assert!(routes
+        assert_eq!(routes.num_tokens, 2);
+        assert_eq!(routes.top_k_experts, 2);
+        assert_eq!(routes.per_expert.len(), 3);
+        assert_eq!(routes.per_expert[0].token_ids, vec![0]);
+        assert_eq!(routes.per_expert[0].weight_positions, vec![0]);
+        assert_eq!(routes.per_expert[1].token_ids, vec![0, 1]);
+        assert_eq!(routes.per_expert[1].weight_positions, vec![1, 3]);
+        assert_eq!(routes.per_expert[2].token_ids, vec![1]);
+        assert_eq!(routes.per_expert[2].weight_positions, vec![2]);
+        assert!(weights
             .iter()
             .flatten()
-            .all(|(_, weight)| weight.is_finite() && *weight > 0.0));
+            .all(|weight| weight.is_finite() && *weight > 0.0));
     }
 
     #[test]
