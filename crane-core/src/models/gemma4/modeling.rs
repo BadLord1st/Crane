@@ -364,6 +364,12 @@ struct Gemma4TextExperts {
 }
 
 impl Gemma4TextExperts {
+    fn routing_weights_tensor(weights: &[f32], like: &Tensor) -> candle_core::Result<Tensor> {
+        Tensor::new(weights, like.device())?
+            .to_dtype(like.dtype())?
+            .reshape((weights.len(), 1))
+    }
+
     fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
         let num_experts = cfg.num_experts.unwrap_or(0);
         let moe_intermediate_size = cfg
@@ -474,8 +480,7 @@ impl Gemma4TextExperts {
             let mut expert_out = hidden.matmul(&down_t)?;
 
             let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
-            let weights_t = Tensor::new(weights.as_slice(), hidden_states.device())?
-                .reshape((assignments.len(), 1))?;
+            let weights_t = Self::routing_weights_tensor(weights.as_slice(), &expert_out)?;
             expert_out = expert_out.broadcast_mul(&weights_t)?;
 
             outputs = outputs.index_add(&token_idx_t, &expert_out, 0)?;
@@ -890,6 +895,21 @@ mod tests {
             .iter()
             .flatten()
             .all(|(_, weight)| weight.is_finite() && *weight > 0.0));
+    }
+
+    #[test]
+    fn experts_router_weights_match_bf16_expert_output_dtype() {
+        let expert_out = Tensor::zeros((2, 4), DType::BF16, &Device::Cpu).expect("expert output");
+
+        let weights_t = Gemma4TextExperts::routing_weights_tensor(&[0.25, 0.75], &expert_out)
+            .expect("routing weights tensor");
+        let scaled = expert_out
+            .broadcast_mul(&weights_t)
+            .expect("bf16 expert output should scale with bf16 routing weights");
+
+        assert_eq!(weights_t.dtype(), DType::BF16);
+        assert_eq!(scaled.dtype(), DType::BF16);
+        assert_eq!(scaled.dims2().expect("scaled dims"), (2, 4));
     }
 }
 
