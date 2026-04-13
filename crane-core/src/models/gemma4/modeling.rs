@@ -41,51 +41,6 @@ fn softmax_last_dim_fallback(xs: &Tensor) -> candle_core::Result<Tensor> {
     exps.broadcast_div(&den)?.to_dtype(input_dtype)
 }
 
-fn attention_with_repeated_kv(
-    query_states: &Tensor,
-    key_states: &Tensor,
-    value_states: &Tensor,
-    attention_mask: Option<&Tensor>,
-    num_kv_groups: usize,
-) -> candle_core::Result<Tensor> {
-    let key_states = repeat_kv(key_states.clone(), num_kv_groups)?.contiguous()?;
-    let value_states = repeat_kv(value_states.clone(), num_kv_groups)?.contiguous()?;
-
-    let attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
-    let attn_weights = match attention_mask {
-        None => attn_weights,
-        Some(mask) => attn_weights.broadcast_add(mask)?,
-    };
-    let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
-    attn_weights.matmul(&value_states)
-}
-
-fn attention_with_grouped_kv(
-    query_states: &Tensor,
-    key_states: &Tensor,
-    value_states: &Tensor,
-    attention_mask: Option<&Tensor>,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-) -> candle_core::Result<Tensor> {
-    let (b_sz, _num_heads, q_len, _) = query_states.dims4()?;
-
-    let query_states =
-        query_states.reshape((b_sz, num_kv_heads, num_kv_groups, q_len, head_dim))?;
-    let key_states = key_states.unsqueeze(2)?;
-    let value_states = value_states.unsqueeze(2)?;
-
-    let attn_weights = query_states.matmul(&key_states.transpose(3, 4)?)?;
-    let attn_weights = match attention_mask {
-        None => attn_weights,
-        Some(mask) => attn_weights.broadcast_add(&mask.unsqueeze(2)?)?,
-    };
-    let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
-    let attn_output = attn_weights.matmul(&value_states)?;
-    attn_output.reshape((b_sz, num_kv_heads * num_kv_groups, q_len, head_dim))
-}
-
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
     pub attention_bias: bool,
@@ -761,26 +716,18 @@ impl Attention {
             (k.clone(), v.clone(), Some((k, v)))
         };
 
+        let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+
         // Gemma4 text eager-attention path uses scaling=1.0.
-        let attn_output = if q_len == 1 && self.num_kv_groups > 1 {
-            attention_with_grouped_kv(
-                &query_states,
-                &key_states,
-                &value_states,
-                attention_mask,
-                self.num_kv_heads,
-                self.num_kv_groups,
-                self.head_dim,
-            )?
-        } else {
-            attention_with_repeated_kv(
-                &query_states,
-                &key_states,
-                &value_states,
-                attention_mask,
-                self.num_kv_groups,
-            )?
+        let attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
+
+        let attn_weights = match attention_mask {
+            None => attn_weights,
+            Some(mask) => attn_weights.broadcast_add(mask)?,
         };
+        let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&value_states)?;
 
         let out = attn_output
             .transpose(1, 2)?
@@ -1054,99 +1001,6 @@ mod tests {
         assert_eq!(weights_t.dtype(), DType::BF16);
         assert_eq!(scaled.dtype(), DType::BF16);
         assert_eq!(scaled.dims2().expect("scaled dims"), (2, 4));
-    }
-
-    fn assert_close(lhs: &Tensor, rhs: &Tensor) {
-        let lhs = lhs
-            .to_dtype(DType::F32)
-            .expect("lhs dtype")
-            .flatten_all()
-            .expect("lhs flatten")
-            .to_vec1::<f32>()
-            .expect("lhs vec");
-        let rhs = rhs
-            .to_dtype(DType::F32)
-            .expect("rhs dtype")
-            .flatten_all()
-            .expect("rhs flatten")
-            .to_vec1::<f32>()
-            .expect("rhs vec");
-        assert_eq!(lhs.len(), rhs.len());
-        for (l, r) in lhs.iter().zip(rhs.iter()) {
-            assert!((l - r).abs() < 1e-5, "lhs={l}, rhs={r}");
-        }
-    }
-
-    #[test]
-    fn decode_grouped_attention_matches_repeated_kv_path() {
-        let device = Device::Cpu;
-        let query_states = Tensor::from_vec(
-            vec![1f32, 2., 3., 4., 5., 6., 7., 8.],
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("query states");
-        let key_states = Tensor::from_vec(vec![0.5f32, 1.5, 2.5, 3.5], (1, 1, 1, 4), &device)
-            .expect("key states");
-        let value_states =
-            Tensor::from_vec(vec![9f32, 8., 7., 6.], (1, 1, 1, 4), &device).expect("value states");
-
-        let repeated =
-            attention_with_repeated_kv(&query_states, &key_states, &value_states, None, 2)
-                .expect("repeated attention");
-        let grouped =
-            attention_with_grouped_kv(&query_states, &key_states, &value_states, None, 1, 2, 4)
-                .expect("grouped attention");
-
-        assert_eq!(repeated.dims4().expect("repeated dims"), (1, 2, 1, 4));
-        assert_eq!(grouped.dims4().expect("grouped dims"), (1, 2, 1, 4));
-        assert_close(&repeated, &grouped);
-    }
-
-    #[test]
-    fn prefill_grouped_attention_matches_repeated_kv_path_with_mask() {
-        let device = Device::Cpu;
-        let query_states = Tensor::from_vec(
-            vec![
-                1f32, 0., 0., 1., 0., 1., 1., 0., // head 0, q_len 2
-                2., 1., 1., 2., 1., 2., 2., 1., // head 1, q_len 2
-            ],
-            (1, 2, 2, 4),
-            &device,
-        )
-        .expect("query states");
-        let key_states = Tensor::from_vec(
-            vec![0.5f32, 0.25, 0.75, 1.25, 1.5, 1.25, 1.75, 2.25],
-            (1, 1, 2, 4),
-            &device,
-        )
-        .expect("key states");
-        let value_states = Tensor::from_vec(
-            vec![9f32, 8., 7., 6., 5., 4., 3., 2.],
-            (1, 1, 2, 4),
-            &device,
-        )
-        .expect("value states");
-        let mask = Tensor::from_vec(vec![0f32, f32::NEG_INFINITY, 0., 0.], (1, 1, 2, 2), &device)
-            .expect("mask");
-
-        let repeated =
-            attention_with_repeated_kv(&query_states, &key_states, &value_states, Some(&mask), 2)
-                .expect("repeated attention");
-        let grouped = attention_with_grouped_kv(
-            &query_states,
-            &key_states,
-            &value_states,
-            Some(&mask),
-            1,
-            2,
-            4,
-        )
-        .expect("grouped attention");
-
-        assert_eq!(repeated.dims4().expect("repeated dims"), (1, 2, 2, 4));
-        assert_eq!(grouped.dims4().expect("grouped dims"), (1, 2, 2, 4));
-        assert_close(&repeated, &grouped);
     }
 }
 
