@@ -277,13 +277,15 @@ impl Module for MLP {
 
 #[derive(Debug, Clone)]
 struct ExpertDispatchPlan {
-    token_ids: Vec<u32>,
-    weight_positions: Vec<u32>,
+    offset: usize,
+    len: usize,
 }
 
 #[derive(Debug, Clone)]
 struct Gemma4RoutingPlan {
     topk_weights: Tensor,
+    token_ids: Tensor,
+    weight_positions: Tensor,
     per_expert: Vec<ExpertDispatchPlan>,
     num_tokens: usize,
     top_k_experts: usize,
@@ -347,11 +349,10 @@ impl Gemma4TextRouter {
                     hidden_states.dtype(),
                     hidden_states.device(),
                 )?,
+                token_ids: Tensor::zeros(0, DType::U32, hidden_states.device())?,
+                weight_positions: Tensor::zeros(0, DType::U32, hidden_states.device())?,
                 per_expert: (0..num_experts)
-                    .map(|_| ExpertDispatchPlan {
-                        token_ids: Vec::new(),
-                        weight_positions: Vec::new(),
-                    })
+                    .map(|_| ExpertDispatchPlan { offset: 0, len: 0 })
                     .collect(),
                 num_tokens,
                 top_k_experts: 0,
@@ -382,22 +383,45 @@ impl Gemma4TextRouter {
             .to_device(&Device::Cpu)?
             .to_vec2::<u32>()?;
 
-        let mut per_expert = (0..num_experts)
-            .map(|_| ExpertDispatchPlan {
-                token_ids: Vec::new(),
-                weight_positions: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        let mut per_expert_token_ids = vec![Vec::new(); num_experts];
+        let mut per_expert_weight_positions = vec![Vec::new(); num_experts];
         for (token_idx, idx_row) in idx_cpu.into_iter().enumerate() {
             for (route_slot, expert_idx) in idx_row.into_iter().enumerate() {
-                let plan = &mut per_expert[expert_idx as usize];
-                plan.token_ids.push(token_idx as u32);
-                plan.weight_positions
-                    .push((token_idx * k + route_slot) as u32);
+                let expert_idx = expert_idx as usize;
+                per_expert_token_ids[expert_idx].push(token_idx as u32);
+                per_expert_weight_positions[expert_idx].push((token_idx * k + route_slot) as u32);
             }
         }
+
+        let mut flat_token_ids = Vec::new();
+        let mut flat_weight_positions = Vec::new();
+        let mut per_expert = Vec::with_capacity(num_experts);
+        for (token_ids, weight_positions) in per_expert_token_ids
+            .into_iter()
+            .zip(per_expert_weight_positions.into_iter())
+        {
+            let offset = flat_token_ids.len();
+            let len = token_ids.len();
+            flat_token_ids.extend(token_ids);
+            flat_weight_positions.extend(weight_positions);
+            per_expert.push(ExpertDispatchPlan { offset, len });
+        }
+
+        let token_ids = Tensor::from_vec(
+            flat_token_ids,
+            flat_weight_positions.len(),
+            hidden_states.device(),
+        )?;
+        let weight_positions = Tensor::from_vec(
+            flat_weight_positions,
+            token_ids.dim(0)?,
+            hidden_states.device(),
+        )?;
+
         Ok(Gemma4RoutingPlan {
             topk_weights,
+            token_ids,
+            weight_positions,
             per_expert,
             num_tokens,
             top_k_experts: k,
@@ -413,6 +437,7 @@ struct Gemma4TextExperts {
 }
 
 impl Gemma4TextExperts {
+    #[cfg(test)]
     fn routing_weights_tensor(weights: &[f32], like: &Tensor) -> candle_core::Result<Tensor> {
         Tensor::new(weights, like.device())?
             .to_dtype(like.dtype())?
@@ -488,7 +513,7 @@ impl Gemma4TextExperts {
 
         let mut expert_cache: HashMap<usize, (Tensor, Tensor)> = HashMap::new();
         for (expert_idx, assignments) in routes.per_expert.iter().enumerate() {
-            if assignments.token_ids.is_empty() {
+            if assignments.len == 0 {
                 continue;
             }
 
@@ -507,8 +532,9 @@ impl Gemma4TextExperts {
             }
             let (gate_up, down) = expert_cache.get(&expert_idx).unwrap();
 
-            let token_idx_t =
-                Tensor::new(assignments.token_ids.as_slice(), hidden_states.device())?;
+            let token_idx_t = routes
+                .token_ids
+                .narrow(0, assignments.offset, assignments.len)?;
             let expert_in = hidden_states.index_select(&token_idx_t, 0)?;
 
             let gate_up_t = gate_up.transpose(0, 1)?;
@@ -521,13 +547,13 @@ impl Gemma4TextExperts {
             let hidden = (gate.apply(&self.act_fn)? * up)?;
             let mut expert_out = hidden.matmul(&down_t)?;
 
-            let weight_idx_t = Tensor::new(
-                assignments.weight_positions.as_slice(),
-                hidden_states.device(),
-            )?;
+            let weight_idx_t =
+                routes
+                    .weight_positions
+                    .narrow(0, assignments.offset, assignments.len)?;
             let weights_t = routing_weights
                 .index_select(&weight_idx_t, 0)?
-                .reshape((assignments.weight_positions.len(), 1))?
+                .reshape((assignments.len, 1))?
                 .to_dtype(expert_out.dtype())?;
             expert_out = expert_out.broadcast_mul(&weights_t)?;
 
@@ -935,16 +961,27 @@ mod tests {
             .expect("weights dtype")
             .to_vec2::<f32>()
             .expect("weights vec");
+        let token_ids = routes.token_ids.to_vec1::<u32>().expect("token ids vec");
+        let weight_positions = routes
+            .weight_positions
+            .to_vec1::<u32>()
+            .expect("weight positions vec");
 
         assert_eq!(routes.num_tokens, 2);
         assert_eq!(routes.top_k_experts, 2);
         assert_eq!(routes.per_expert.len(), 3);
-        assert_eq!(routes.per_expert[0].token_ids, vec![0]);
-        assert_eq!(routes.per_expert[0].weight_positions, vec![0]);
-        assert_eq!(routes.per_expert[1].token_ids, vec![0, 1]);
-        assert_eq!(routes.per_expert[1].weight_positions, vec![1, 3]);
-        assert_eq!(routes.per_expert[2].token_ids, vec![1]);
-        assert_eq!(routes.per_expert[2].weight_positions, vec![2]);
+        assert_eq!(routes.per_expert[0].offset, 0);
+        assert_eq!(routes.per_expert[0].len, 1);
+        assert_eq!(&token_ids[0..1], &[0]);
+        assert_eq!(&weight_positions[0..1], &[0]);
+        assert_eq!(routes.per_expert[1].offset, 1);
+        assert_eq!(routes.per_expert[1].len, 2);
+        assert_eq!(&token_ids[1..3], &[0, 1]);
+        assert_eq!(&weight_positions[1..3], &[1, 3]);
+        assert_eq!(routes.per_expert[2].offset, 3);
+        assert_eq!(routes.per_expert[2].len, 1);
+        assert_eq!(&token_ids[3..4], &[1]);
+        assert_eq!(&weight_positions[3..4], &[2]);
         assert!(weights
             .iter()
             .flatten()
