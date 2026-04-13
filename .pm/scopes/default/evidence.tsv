@@ -1,0 +1,9 @@
+ticket_id	date	kind	ref	note
+T-0001	2026-04-13T00:00:00Z	test	cargo test -p crane-core gemma4::modeling::tests	3 passed; validates attention_k_eq_v loader behavior and missing v_proj fallback
+T-0001	2026-04-13T00:00:00Z	test	cargo test -p crane-core gemma4	Gemma4-targeted crate tests passed
+T-0001	2026-04-13T00:00:00Z	test	cargo test -p crane-oai model_factory	19 passed; model factory detection unchanged
+T-0001	2026-04-13T00:00:00Z	build	cargo build -p crane-oai --release	Release build passed locally
+T-0002	2026-04-13T00:00:00Z	build	1stbadwolf/crane:enginev1-gemma4-keqv-2e99c05	Built on my69 with CUDA_COMPUTE_CAP=89
+T-0002	2026-04-13T00:00:00Z	image	1stbadwolf/crane@sha256:1af34fa1778642e43186976c83e6409e2c8d60a3b7a05a1bb4245705db6598b1	Pushed image digest from my69
+T-0002	2026-04-13T00:00:00Z	deploy	kubectl set image/scale deployment gemma-4-26b-a4b-it-crane	Deployment updated to new digest and scaled to 1
+T-0002	2026-04-13T00:00:00Z	log	kubectl logs pod/gemma-4-26b-a4b-it-crane-85c7d8f75c-lzf46	Pod starts and reaches startup phase=mode_select without previous immediate layer-5 crash
