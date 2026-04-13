@@ -87,23 +87,21 @@ impl RuntimeModel for HunyuanRuntimeAdapter {
         true
     }
 
-    fn kv_extract(&self) -> LayerKvCaches {
+    fn kv_extract(&self) -> Result<LayerKvCaches> {
         let backend = Bf16PassthroughBackend;
         self.model
             .get_kv_caches()
             .into_iter()
             .enumerate()
             .map(|(layer_idx, dense)| {
-                backend
-                    .export_layer(layer_idx, dense)
-                    .unwrap_or_else(|err| {
-                        panic!("Hunyuan KV export failed for layer {layer_idx}: {err}")
-                    })
+                backend.export_layer(layer_idx, dense).map_err(|err| {
+                    anyhow::anyhow!("Hunyuan KV export failed for layer {layer_idx}: {err}")
+                })
             })
             .collect()
     }
 
-    fn kv_restore(&mut self, caches: LayerKvCaches) {
+    fn kv_restore(&mut self, caches: LayerKvCaches) -> Result<()> {
         let backend = Bf16PassthroughBackend;
         let dense = caches
             .into_iter()
@@ -111,12 +109,13 @@ impl RuntimeModel for HunyuanRuntimeAdapter {
             .map(|(layer_idx, stored)| {
                 backend
                     .import_layer(layer_idx, stored, self.device(), self.dtype())
-                    .unwrap_or_else(|err| {
-                        panic!("Hunyuan KV restore failed for layer {layer_idx}: {err}")
+                    .map_err(|err| {
+                        anyhow::anyhow!("Hunyuan KV restore failed for layer {layer_idx}: {err}")
                     })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         self.model.set_kv_caches(dense);
+        Ok(())
     }
 
     fn kv_bytes(&self) -> u64 {
