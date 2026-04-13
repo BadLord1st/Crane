@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::policies::placement_policy::PlacementPolicy;
-use engine::runtime::ModelSpec;
+use engine::runtime::{KvBackendConfig, ModelSpec};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use gemma4_output::OutputMode;
 use handlers::tts::TtsGenerateRequest;
@@ -98,6 +98,10 @@ struct Args {
     /// Device placement policy for runtime hooks.
     #[arg(long, value_enum, default_value_t = PlacementMode::KeepOnDevice)]
     placement_policy: PlacementMode,
+
+    /// KV cache storage backend. CLI overrides CRANE_KV_CACHE_MODE.
+    #[arg(long)]
+    kv_cache_mode: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -284,6 +288,9 @@ async fn main() -> Result<()> {
 
     let model_type = ModelType::from_str(&args.model_type);
     let format = ModelFormat::from_str(&args.format);
+    let env_kv_cache_mode = std::env::var("CRANE_KV_CACHE_MODE").ok();
+    let kv_backend_config =
+        KvBackendConfig::resolve(args.kv_cache_mode.as_deref(), env_kv_cache_mode.as_deref())?;
 
     // Resolve auto-detection early so we know if this is VLM.
     let resolved_type = if model_type == ModelType::Auto {
@@ -297,10 +304,11 @@ async fn main() -> Result<()> {
     let model_spec = engine::model_factory::create_model_spec(resolved_type, &args.model_path);
 
     info!(
-        "Startup config: model_type_arg={}, resolved_model_type={}, format={}, host={}, port={}, cpu={}, max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, gpu_memory_limit={}",
+        "Startup config: model_type_arg={}, resolved_model_type={}, format={}, kv_cache_mode={}, host={}, port={}, cpu={}, max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, gpu_memory_limit={}",
         args.model_type,
         resolved_type.display_name(),
         args.format,
+        kv_backend_config.mode,
         args.host,
         args.port,
         args.cpu,
@@ -650,6 +658,7 @@ async fn main() -> Result<()> {
             &device,
             &dtype,
             format,
+            kv_backend_config,
         )?;
 
         info!(

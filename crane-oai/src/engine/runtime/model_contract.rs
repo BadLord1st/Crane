@@ -1,11 +1,8 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
+use super::kv_backend::{move_kv_caches_to_device, LayerKvCaches, SequenceKvCaches};
 use crate::engine::types::MultimodalInputs;
-
-pub type LayerKv = Option<(Tensor, Tensor)>;
-pub type LayerKvCaches = Vec<LayerKv>;
-pub type SequenceKvCaches = Vec<LayerKvCaches>;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeRequestContext {
@@ -82,27 +79,7 @@ pub trait RuntimeModel: Send + 'static {
             return 0;
         }
 
-        let mut moved = 0usize;
-        for cache in caches {
-            let Some((k, v)) = cache else {
-                continue;
-            };
-            if matches!(k.device(), Device::Cpu) {
-                continue;
-            }
-
-            let Ok(new_k) = k.to_device(&Device::Cpu) else {
-                continue;
-            };
-            let Ok(new_v) = v.to_device(&Device::Cpu) else {
-                continue;
-            };
-
-            *k = new_k;
-            *v = new_v;
-            moved += 2;
-        }
-        moved
+        move_kv_caches_to_device(caches, &Device::Cpu)
     }
 
     /// Move sequence KV caches onto model device before restore/decode.
@@ -112,27 +89,7 @@ pub trait RuntimeModel: Send + 'static {
             return 0;
         }
 
-        let mut moved = 0usize;
-        for cache in caches {
-            let Some((k, v)) = cache else {
-                continue;
-            };
-            if !matches!(k.device(), Device::Cpu) {
-                continue;
-            }
-
-            let Ok(new_k) = k.to_device(self.device()) else {
-                continue;
-            };
-            let Ok(new_v) = v.to_device(self.device()) else {
-                continue;
-            };
-
-            *k = new_k;
-            *v = new_v;
-            moved += 2;
-        }
-        moved
+        move_kv_caches_to_device(caches, self.device())
     }
 
     fn supports_batch_decode(&self) -> bool {

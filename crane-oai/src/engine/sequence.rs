@@ -1,28 +1,12 @@
-use candle_core::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 
+use super::runtime::LayerKvCaches;
 use super::types::MultimodalInputs;
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
-pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
-    caches
-        .iter()
-        .filter_map(|c| c.as_ref())
-        .map(|(k, v)| {
-            let k_bytes = if matches!(k.device(), Device::Cpu) {
-                0
-            } else {
-                k.elem_count() as u64 * k.dtype().size_in_bytes() as u64
-            };
-            let v_bytes = if matches!(v.device(), Device::Cpu) {
-                0
-            } else {
-                v.elem_count() as u64 * v.dtype().size_in_bytes() as u64
-            };
-            k_bytes + v_bytes
-        })
-        .sum()
+pub fn kv_cache_bytes(caches: &LayerKvCaches) -> u64 {
+    super::runtime::kv_backend::stored_kv_cache_bytes(caches)
 }
 
 /// Per-request lifecycle.
@@ -54,8 +38,8 @@ pub struct Sequence {
 
     // ── KV cache (one entry per transformer layer) ──
     /// Saved KV caches when this sequence is not the one loaded in the model.
-    /// Each element is `(K, V)` for a layer, or `None` for fresh layers.
-    pub kv_caches: Vec<Option<(Tensor, Tensor)>>,
+    /// Each element is a runtime-owned envelope for one layer, or `None` for fresh layers.
+    pub kv_caches: LayerKvCaches,
 
     // ── sampling ──
     pub logits_processor: LogitsProcessor,

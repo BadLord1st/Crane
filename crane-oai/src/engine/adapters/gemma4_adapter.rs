@@ -1,24 +1,30 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
-use crate::engine::runtime::model_contract::LayerKvCaches;
-
 use crate::engine::runtime::{
-    RuntimeModel, RuntimeRequestContext, RuntimeStateDelta, RuntimeStepContext, RuntimeStepOutput,
+    make_kv_backend, KvBackendConfig, KvCacheBackend, LayerKvCaches, RuntimeModel,
+    RuntimeRequestContext, RuntimeStateDelta, RuntimeStepContext, RuntimeStepOutput,
 };
 
 pub struct Gemma4RuntimeAdapter {
     model: crane_core::models::gemma4::Model,
+    kv_backend: Box<dyn KvCacheBackend>,
 }
 
 impl Gemma4RuntimeAdapter {
-    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+    pub fn new(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        kv_config: KvBackendConfig,
+    ) -> Result<Self> {
         let load_dtype = match device {
             Device::Cpu => *dtype,
             _ => DType::BF16,
         };
         let model = crane_core::models::gemma4::Model::new(model_path, device, &load_dtype)?;
-        Ok(Self { model })
+        let kv_backend = make_kv_backend(kv_config)?;
+        Ok(Self { model, kv_backend })
     }
 }
 
@@ -88,11 +94,41 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
     }
 
     fn kv_extract(&self) -> LayerKvCaches {
-        self.model.get_kv_caches()
+        self.model
+            .get_kv_caches()
+            .into_iter()
+            .enumerate()
+            .map(|(layer_idx, dense)| {
+                self.kv_backend
+                    .export_layer(layer_idx, dense)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Gemma4 KV export failed for layer {} with backend '{}': {err}",
+                            layer_idx,
+                            self.kv_backend.backend_id()
+                        )
+                    })
+            })
+            .collect()
     }
 
     fn kv_restore(&mut self, caches: LayerKvCaches) {
-        self.model.set_kv_caches(caches);
+        let dense = caches
+            .into_iter()
+            .enumerate()
+            .map(|(layer_idx, stored)| {
+                self.kv_backend
+                    .import_layer(layer_idx, stored, self.device(), self.dtype())
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Gemma4 KV restore failed for layer {} with backend '{}': {err}",
+                            layer_idx,
+                            self.kv_backend.backend_id()
+                        )
+                    })
+            })
+            .collect();
+        self.model.set_kv_caches(dense);
     }
 
     fn kv_bytes(&self) -> u64 {

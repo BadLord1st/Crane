@@ -14,8 +14,9 @@ use super::adapters::hunyuan_adapter::HunyuanRuntimeAdapter;
 use super::adapters::qwen25_adapter::Qwen25RuntimeAdapter;
 use super::adapters::qwen3_adapter::Qwen3RuntimeAdapter;
 use super::runtime::{
-    ChatFormatStrategy, EngineLimitsProfile, ModelCapabilities as RuntimeCapabilities, ModelSpec,
-    OutputStrategy, RuntimeModel, SamplingDefaults,
+    ChatFormatStrategy, EngineLimitsProfile, KvBackendConfig,
+    ModelCapabilities as RuntimeCapabilities, ModelSpec, OutputStrategy, RuntimeModel,
+    SamplingDefaults,
 };
 use crate::chat_template::{
     AutoChatTemplate, ChatTemplateProcessor, Gemma4ChatTemplate, HunyuanChatTemplate,
@@ -400,7 +401,17 @@ pub fn create_runtime_model(
     device: &Device,
     dtype: &DType,
     format: ModelFormat,
+    kv_backend_config: KvBackendConfig,
 ) -> Result<Box<dyn RuntimeModel>> {
+    if matches!(
+        kv_backend_config.mode,
+        super::runtime::KvCacheMode::TurboQuant
+    ) {
+        anyhow::bail!(
+            "KV cache mode 'turboquant' is reserved for future support and unsupported in this build"
+        );
+    }
+
     let model_type = resolve(model_type, model_path);
     match model_type {
         ModelType::HunyuanDense => {
@@ -424,7 +435,10 @@ pub fn create_runtime_model(
                 anyhow::bail!("Gemma 4 GGUF is not supported yet. Use safetensors checkpoints.");
             }
             Ok(Box::new(Gemma4RuntimeAdapter::new(
-                model_path, device, dtype,
+                model_path,
+                device,
+                dtype,
+                kv_backend_config,
             )?))
         }
         ModelType::Qwen3 => Ok(Box::new(Qwen3RuntimeAdapter::new(
