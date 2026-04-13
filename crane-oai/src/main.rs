@@ -210,6 +210,20 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn query_gpu_memory_usage(device: &crane_core::models::Device) -> (u64, u64) {
+    #[cfg(feature = "cuda")]
+    {
+        if let crane_core::models::Device::Cuda(_) = device {
+            if let Ok((free, total)) =
+                candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+            {
+                return ((total - free) as u64, total as u64);
+            }
+        }
+    }
+    (0, 0)
+}
+
 pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
@@ -688,6 +702,14 @@ async fn main() -> Result<()> {
             MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
+        let (gpu_used_now, gpu_total_now) = query_gpu_memory_usage(&device);
+        let gpu_free_now = gpu_total_now.saturating_sub(gpu_used_now);
+        let configured_limit = if memory_config.gpu_memory_limit_bytes == 0 {
+            gpu_total_now
+        } else {
+            memory_config.gpu_memory_limit_bytes
+        };
+        let configured_headroom = configured_limit.saturating_sub(baseline_gpu);
         info!(
             "Memory config: max_seq_len={}, text_prefill_token_limit={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
             if memory_config.max_seq_len == 0 {
@@ -706,6 +728,23 @@ async fn main() -> Result<()> {
             },
             format_bytes(baseline_gpu),
             memory_init_t0.elapsed().as_millis(),
+        );
+        info!(
+            "GPU memory snapshot: total={}, used_now={}, free_now={}, model_baseline={}, configured_limit={}, configured_headroom={}",
+            format_bytes(gpu_total_now),
+            format_bytes(gpu_used_now),
+            format_bytes(gpu_free_now),
+            format_bytes(baseline_gpu),
+            if memory_config.gpu_memory_limit_bytes == 0 {
+                "unlimited".to_string()
+            } else {
+                format_bytes(memory_config.gpu_memory_limit_bytes)
+            },
+            if memory_config.gpu_memory_limit_bytes == 0 {
+                format!("{} (until full GPU)", format_bytes(configured_headroom))
+            } else {
+                format_bytes(configured_headroom)
+            },
         );
         if memory_config.text_prefill_token_limit.is_some() {
             info!(
@@ -861,11 +900,13 @@ async fn main() -> Result<()> {
     println!("  {sep}\n");
 
     info!(
-        "Startup complete (total_startup_ms={}, model_type={}, device={}, dtype={})",
+        "Startup complete (total_startup_ms={}, model_type={}, device={}, dtype={}, kv_cache_mode={}, text_prefill_token_limit={})",
         startup_t0.elapsed().as_millis(),
         resolved_type.display_name(),
         state.device_name,
         state.dtype_name,
+        kv_backend_config.mode,
+        std::env::var("CRANE_TEXT_PREFILL_TOKEN_LIMIT").unwrap_or_else(|_| "disabled".to_string()),
     );
 
     axum::serve(listener, app).await?;
