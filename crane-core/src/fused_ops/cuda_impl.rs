@@ -362,6 +362,10 @@ struct TopkTmpBufs {
 /// Two-stage block reduction using custom CUDA kernels compiled from
 /// `crane-core/kernels/fused_ops.cu`.
 ///
+/// Launch shared memory is `128 * k * (sizeof(f32) + sizeof(u32))` bytes per
+/// stage. These kernels currently rely on the caller to keep `k` within the
+/// device's non-opt-in dynamic shared-memory budget.
+///
 /// Returns a `[k]` U32 tensor of the indices of the k largest values,
 /// sorted in descending order of value.
 #[cfg(feature = "cuda")]

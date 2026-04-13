@@ -126,17 +126,60 @@ enum GpuTopkPlan {
     UseCpu,
 }
 
+const DEFAULT_GPU_TOPP_FALLBACK_TOPK: usize = 64;
+const DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES: usize = 48 * 1024;
+const TOPK_BLOCK_DIM: usize = 128;
+const BYTES_PER_TOPK_ENTRY: usize = std::mem::size_of::<f32>() + std::mem::size_of::<u32>();
+
+fn requested_gpu_topk(
+    explicit_top_k: Option<usize>,
+    top_p_active: bool,
+    top_p_fallback_topk: usize,
+) -> usize {
+    let top_k = explicit_top_k.unwrap_or(0);
+    if top_k == 0 && top_p_active {
+        top_p_fallback_topk
+    } else {
+        top_k
+    }
+}
+
+fn top_p_fallback_topk_from_env() -> usize {
+    std::env::var("CRANE_TOPP_FALLBACK_TOPK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_TOPP_FALLBACK_TOPK)
+}
+
+fn max_gpu_topk_for_shared_mem_budget(smem_budget: usize) -> usize {
+    (smem_budget / (TOPK_BLOCK_DIM * BYTES_PER_TOPK_ENTRY)).clamp(8, 64)
+}
+
 fn max_gpu_topk_by_shared_mem(device: &Device) -> usize {
     // Matches the launch config in crane-core/src/fused_ops/cuda_impl.rs:
     // shared = block_dim(128) * k * (sizeof(f32) + sizeof(u32)).
-    // Budget is detected from the current CUDA device attributes.
-    const DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES: usize = 48 * 1024;
-    const TOPK_BLOCK_DIM: usize = 128;
-    const BYTES_PER_TOPK_ENTRY: usize = std::mem::size_of::<f32>() + std::mem::size_of::<u32>();
-
+    //
+    // IMPORTANT: the top-k kernels do not opt into >48 KiB dynamic shared
+    // memory via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES before launch.
+    // That means the planner must stay within the per-launch budget guaranteed
+    // to work without kernel attribute changes, otherwise launches can fail with
+    // CUDA_ERROR_INVALID_VALUE on Ada-class GPUs.
     let smem_budget = detect_cuda_dynamic_smem_per_block_bytes(device)
         .unwrap_or(DEFAULT_DYNAMIC_SMEM_PER_BLOCK_BYTES);
-    (smem_budget / (TOPK_BLOCK_DIM * BYTES_PER_TOPK_ENTRY)).clamp(8, 64)
+    max_gpu_topk_for_shared_mem_budget(smem_budget)
+}
+
+fn build_gpu_topk_plan_with_limits(
+    requested_top_k: usize,
+    vocab: usize,
+    max_gpu_topk: usize,
+) -> GpuTopkPlan {
+    let top_k = requested_top_k.min(max_gpu_topk).min(vocab);
+    if top_k > 0 && top_k < vocab {
+        GpuTopkPlan::UseGpu { top_k }
+    } else {
+        GpuTopkPlan::UseCpu
+    }
 }
 
 fn build_gpu_topk_plan(
@@ -145,20 +188,10 @@ fn build_gpu_topk_plan(
     top_p_active: bool,
     device: &Device,
 ) -> GpuTopkPlan {
-    let mut top_k = seq.top_k.unwrap_or(0);
-    if top_k == 0 && top_p_active {
-        top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64);
-    }
-
-    let top_k = top_k.min(max_gpu_topk_by_shared_mem(device)).min(vocab);
-    if top_k > 0 && top_k < vocab {
-        GpuTopkPlan::UseGpu { top_k }
-    } else {
-        GpuTopkPlan::UseCpu
-    }
+    let requested_top_k =
+        requested_gpu_topk(seq.top_k, top_p_active, top_p_fallback_topk_from_env());
+    let max_gpu_topk = max_gpu_topk_by_shared_mem(device);
+    build_gpu_topk_plan_with_limits(requested_top_k, vocab, max_gpu_topk)
 }
 
 fn detect_cuda_dynamic_smem_per_block_bytes(device: &Device) -> Option<usize> {
@@ -178,21 +211,9 @@ fn detect_cuda_dynamic_smem_per_block_bytes(device: &Device) -> Option<usize> {
                 Err(_) => return None,
             };
 
-            // Prefer opt-in limit when available (newer architectures).
-            let optin = unsafe {
-                result::device::get_attribute(
-                    cu_dev,
-                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                )
-            }
-            .ok()
-            .filter(|&v| v > 0)
-            .map(|v| v as usize);
-
-            if optin.is_some() {
-                return optin;
-            }
-
+            // Use the guaranteed per-block dynamic shared-memory limit only.
+            // The kernels currently do not opt into the larger *_OPTIN budget,
+            // so planning against that higher value can produce invalid launches.
             let base = unsafe {
                 result::device::get_attribute(
                     cu_dev,
@@ -551,6 +572,45 @@ mod tests {
 
         let mat2 = b.get_topk_cumsum_mat(4, &dev).unwrap();
         assert_eq!(mat2.dims(), &[4, 4]);
+    }
+
+    #[test]
+    fn requested_gpu_topk_uses_top_p_fallback_when_top_k_disabled() {
+        assert_eq!(requested_gpu_topk(None, true, 64), 64);
+        assert_eq!(requested_gpu_topk(Some(0), true, 64), 64);
+    }
+
+    #[test]
+    fn requested_gpu_topk_preserves_explicit_top_k() {
+        assert_eq!(requested_gpu_topk(Some(40), true, 64), 40);
+        assert_eq!(requested_gpu_topk(Some(40), false, 64), 40);
+        assert_eq!(requested_gpu_topk(None, false, 64), 0);
+    }
+
+    #[test]
+    fn max_gpu_topk_for_48k_shared_mem_budget_is_48() {
+        assert_eq!(max_gpu_topk_for_shared_mem_budget(48 * 1024), 48);
+    }
+
+    #[test]
+    fn max_gpu_topk_for_large_budget_is_still_kernel_capped() {
+        assert_eq!(max_gpu_topk_for_shared_mem_budget(96 * 1024), 64);
+    }
+
+    #[test]
+    fn build_gpu_topk_plan_caps_requested_top_k_to_safe_budget() {
+        match build_gpu_topk_plan_with_limits(64, 256_000, 48) {
+            GpuTopkPlan::UseGpu { top_k } => assert_eq!(top_k, 48),
+            GpuTopkPlan::UseCpu => panic!("expected GPU plan"),
+        }
+    }
+
+    #[test]
+    fn build_gpu_topk_plan_uses_cpu_when_capped_top_k_reaches_vocab() {
+        assert!(matches!(
+            build_gpu_topk_plan_with_limits(64, 48, 48),
+            GpuTopkPlan::UseCpu
+        ));
     }
 
     // ── apply_repeat_penalty_inplace tests ──
