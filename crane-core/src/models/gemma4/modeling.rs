@@ -22,6 +22,26 @@ pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
         target_device: &Device,
         target_dtype: DType,
     ) -> candle_core::Result<Option<Tensor>>;
+
+    fn weighted_value_prefix(
+        &self,
+        layer_idx: usize,
+        attn_weights: &Tensor,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> candle_core::Result<Option<Tensor>> {
+        let _ = (
+            layer_idx,
+            attn_weights,
+            num_kv_heads,
+            num_kv_groups,
+            target_device,
+            target_dtype,
+        );
+        Ok(None)
+    }
 }
 
 fn gemma4_perf_enabled() -> bool {
@@ -742,24 +762,21 @@ impl Attention {
         // Gemma4 text eager-attention path uses scaling=1.0.
         let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
+        let mut prefix_scores_and_source = None;
         if b_sz == 1 && q_len == 1 && shared_kv.is_none() {
             if let Some(prefix_kv) = decode_prefix_kv {
-                if let (Some(prefix_scores), Some(prefix_values)) = (
-                    prefix_kv.score_prefix_keys(
-                        self.layer_idx,
-                        &query_states,
-                        self.num_kv_heads,
-                        self.num_kv_groups,
-                    )?,
-                    prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?,
-                ) {
+                if let Some(prefix_scores) = prefix_kv.score_prefix_keys(
+                    self.layer_idx,
+                    &query_states,
+                    self.num_kv_heads,
+                    self.num_kv_groups,
+                )? {
                     let prefix_scores = prefix_scores
                         .to_device(query_states.device())?
                         .to_dtype(query_states.dtype())?;
-                    let prefix_values =
-                        repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
+                    let prefix_len = prefix_scores.dim(D::Minus1)?;
                     attn_weights = Tensor::cat(&[&prefix_scores, &attn_weights], D::Minus1)?;
-                    value_states = Tensor::cat(&[&prefix_values, &value_states], 2)?;
+                    prefix_scores_and_source = Some((prefix_len, prefix_kv));
                 }
             }
         }
@@ -769,7 +786,34 @@ impl Attention {
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
         let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&value_states)?;
+        let attn_output = if let Some((prefix_len, prefix_kv)) = prefix_scores_and_source {
+            let total_len = attn_weights.dim(D::Minus1)?;
+            let local_len = total_len.saturating_sub(prefix_len);
+            let prefix_probs = attn_weights.narrow(D::Minus1, 0, prefix_len)?;
+            let local_probs = attn_weights.narrow(D::Minus1, prefix_len, local_len)?;
+            let local_output = local_probs.matmul(&value_states)?;
+
+            if let Some(prefix_output) = prefix_kv.weighted_value_prefix(
+                self.layer_idx,
+                &prefix_probs,
+                self.num_kv_heads,
+                self.num_kv_groups,
+                xs.device(),
+                xs.dtype(),
+            )? {
+                local_output.broadcast_add(&prefix_output)?
+            } else if let Some(prefix_values) =
+                prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?
+            {
+                let prefix_values = repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
+                let prefix_output = prefix_probs.matmul(&prefix_values)?;
+                local_output.broadcast_add(&prefix_output)?
+            } else {
+                local_output
+            }
+        } else {
+            attn_weights.matmul(&value_states)?
+        };
 
         let out = attn_output
             .transpose(1, 2)?
@@ -828,6 +872,8 @@ mod tests {
     #[derive(Debug)]
     struct DummyDecodePrefixKvSource {
         calls: Arc<AtomicUsize>,
+        weighted_calls: Arc<AtomicUsize>,
+        value_calls: Arc<AtomicUsize>,
         scores: Tensor,
         values: Tensor,
     }
@@ -850,6 +896,20 @@ mod tests {
             _target_device: &Device,
             _target_dtype: DType,
         ) -> candle_core::Result<Option<Tensor>> {
+            self.value_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.values.clone()))
+        }
+
+        fn weighted_value_prefix(
+            &self,
+            _layer_idx: usize,
+            _attn_weights: &Tensor,
+            _num_kv_heads: usize,
+            _num_kv_groups: usize,
+            _target_device: &Device,
+            _target_dtype: DType,
+        ) -> candle_core::Result<Option<Tensor>> {
+            self.weighted_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(self.values.clone()))
         }
     }
@@ -1126,8 +1186,12 @@ mod tests {
         let xs =
             Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
         let calls = Arc::new(AtomicUsize::new(0));
+        let weighted_calls = Arc::new(AtomicUsize::new(0));
+        let value_calls = Arc::new(AtomicUsize::new(0));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
+            weighted_calls: weighted_calls.clone(),
+            value_calls: value_calls.clone(),
             scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
                 .expect("prefix scores"),
             values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
@@ -1144,6 +1208,8 @@ mod tests {
             .expect("output vec");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(weighted_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(value_calls.load(Ordering::SeqCst), 0);
         assert_eq!(output[0][0], vec![3.0, 4.0, 3.0, 4.0]);
     }
 
@@ -1159,8 +1225,12 @@ mod tests {
         let xs =
             Tensor::ones((1, 2, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
         let calls = Arc::new(AtomicUsize::new(0));
+        let weighted_calls = Arc::new(AtomicUsize::new(0));
+        let value_calls = Arc::new(AtomicUsize::new(0));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
+            weighted_calls: weighted_calls.clone(),
+            value_calls: value_calls.clone(),
             scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
                 .expect("prefix scores"),
             values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
@@ -1177,6 +1247,8 @@ mod tests {
             .expect("output vec");
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(weighted_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(value_calls.load(Ordering::SeqCst), 0);
         assert_eq!(output, vec![vec![vec![0.0; 4], vec![0.0; 4]]]);
     }
 
@@ -1192,8 +1264,12 @@ mod tests {
         let xs =
             Tensor::ones((2, 1, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
         let calls = Arc::new(AtomicUsize::new(0));
+        let weighted_calls = Arc::new(AtomicUsize::new(0));
+        let value_calls = Arc::new(AtomicUsize::new(0));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
+            weighted_calls: weighted_calls.clone(),
+            value_calls: value_calls.clone(),
             scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
                 .expect("prefix scores"),
             values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
@@ -1210,6 +1286,8 @@ mod tests {
             .expect("output vec");
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(weighted_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(value_calls.load(Ordering::SeqCst), 0);
         assert_eq!(output, vec![vec![vec![0.0; 4]], vec![vec![0.0; 4]]]);
     }
 }
