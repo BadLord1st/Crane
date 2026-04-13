@@ -319,7 +319,7 @@ impl Gemma4TextRouter {
 
         // Device-side top-k indices and probs.
         let sorted_idx = probs.arg_sort_last_dim(false)?;
-        let topk_idx = sorted_idx.narrow(1, 0, k)?;
+        let topk_idx = sorted_idx.narrow(1, 0, k)?.contiguous()?;
         let topk_probs = probs.gather(&topk_idx, D::Minus1)?;
 
         // Normalize top-k weights and apply per-expert scaling.
@@ -329,7 +329,8 @@ impl Gemma4TextRouter {
         let scale_2d = self
             .per_expert_scale
             .unsqueeze(0)?
-            .expand((num_tokens, num_experts))?;
+            .expand((num_tokens, num_experts))?
+            .contiguous()?;
         let topk_scales = scale_2d.gather(&topk_idx, D::Minus1)?;
         let topk_weights = topk_norm.broadcast_mul(&topk_scales)?;
 
@@ -763,6 +764,37 @@ mod tests {
         Ok(tensors)
     }
 
+    fn moe_test_config(num_experts: usize, top_k_experts: usize) -> Config {
+        let mut cfg = test_config(false);
+        cfg.enable_moe_block = true;
+        cfg.num_experts = Some(num_experts);
+        cfg.top_k_experts = Some(top_k_experts);
+        cfg
+    }
+
+    fn router_tensor_map() -> candle_core::Result<HashMap<String, Tensor>> {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "proj.weight".to_string(),
+            Tensor::from_vec(
+                vec![
+                    3f32, 0., 0., 0., // expert 0
+                    2., 1., 0., 0., // expert 1
+                    1., 2., 0., 0., // expert 2
+                ],
+                (3, 4),
+                &device,
+            )?,
+        );
+        tensors.insert("scale".to_string(), Tensor::ones(4, DType::F32, &device)?);
+        tensors.insert(
+            "per_expert_scale".to_string(),
+            Tensor::from_vec(vec![1f32, 2., 3.], 3, &device)?,
+        );
+        Ok(tensors)
+    }
+
     #[test]
     fn config_deserialization_preserves_attention_k_eq_v_flag() {
         let cfg: Config = serde_json::from_value(json!({
@@ -822,6 +854,42 @@ mod tests {
         let err = Attention::new(&cfg, 0, vb).expect_err("v_proj should still be required");
 
         assert!(err.to_string().contains("v_proj.weight"));
+    }
+
+    #[test]
+    fn router_route_handles_non_contiguous_topk_gather_inputs() {
+        let cfg = moe_test_config(3, 2);
+        let vb = VarBuilder::from_tensors(
+            router_tensor_map().expect("router tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let router = Gemma4TextRouter::new(&cfg, vb).expect("router should build");
+        let hidden_states = Tensor::from_vec(
+            vec![
+                1f32, 0., 0., 0., // token 0 -> experts 0,1
+                0., 1., 0., 0., // token 1 -> experts 2,1
+            ],
+            (2, cfg.hidden_size),
+            &Device::Cpu,
+        )
+        .expect("hidden states");
+
+        let routes = router.route(&hidden_states).expect("route should succeed");
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            routes[0].iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            routes[1].iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(routes
+            .iter()
+            .flatten()
+            .all(|(_, weight)| weight.is_finite() && *weight > 0.0));
     }
 }
 
