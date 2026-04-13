@@ -912,7 +912,9 @@ impl InferenceEngine {
     fn step_prefill(&mut self, seq_id: String) {
         let t0 = Instant::now();
 
-        self.swap_in(&seq_id);
+        if !self.swap_in(&seq_id) {
+            return;
+        }
 
         let (input_ids, start_pos) = {
             let seq = self.sequences.get(&seq_id).unwrap();
@@ -1086,9 +1088,18 @@ impl InferenceEngine {
         // Flush model's internal KV cache state.
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
-                let caches = self.model.kv_extract();
-                if let Some(seq) = self.sequences.get_mut(prev_id) {
-                    seq.kv_caches = caches;
+                match self.model.kv_extract() {
+                    Ok(caches) => {
+                        if let Some(seq) = self.sequences.get_mut(prev_id) {
+                            seq.kv_caches = caches;
+                        }
+                    }
+                    Err(err) => {
+                        self.model.clear_kv_cache();
+                        self.recount_kv_bytes();
+                        self.send_error(prev_id, &format!("KV export failed: {err}"));
+                        return;
+                    }
                 }
             }
             self.model.clear_kv_cache();
@@ -1371,7 +1382,9 @@ impl InferenceEngine {
             }
 
             let t_swap_in = Instant::now();
-            self.swap_in(seq_id);
+            if !self.swap_in(seq_id) {
+                continue;
+            }
             swap_in_us += t_swap_in.elapsed().as_micros() as u64;
 
             debug!(id = %seq_id, "Sequential decode sequence activated");
@@ -1493,9 +1506,9 @@ impl InferenceEngine {
     //  KV cache management
     // ─────────────────────────────────────────────────────────
 
-    fn swap_in(&mut self, seq_id: &str) {
+    fn swap_in(&mut self, seq_id: &str) -> bool {
         if self.active_seq_id.as_deref() == Some(seq_id) {
-            return;
+            return true;
         }
 
         debug!(
@@ -1510,14 +1523,22 @@ impl InferenceEngine {
                 self.model.clear_kv_cache();
                 self.active_seq_id = Some(seq_id.to_string());
             }
-            return;
+            return true;
         }
 
         // Save previous active sequence's KV cache from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
-            let caches = self.model.kv_extract();
-            if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
-                prev_seq.kv_caches = caches;
+            match self.model.kv_extract() {
+                Ok(caches) => {
+                    if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
+                        prev_seq.kv_caches = caches;
+                    }
+                }
+                Err(err) => {
+                    self.model.clear_kv_cache();
+                    self.recount_kv_bytes();
+                    self.send_error(prev_id, &format!("KV export failed: {err}"));
+                }
             }
         }
 
@@ -1538,7 +1559,12 @@ impl InferenceEngine {
                     .fetch_add(prefetched_tensors as u64, Ordering::Relaxed);
             }
         }
-        self.model.kv_restore(caches);
+        if let Err(err) = self.model.kv_restore(caches) {
+            self.model.clear_kv_cache();
+            self.recount_kv_bytes();
+            self.send_error(seq_id, &format!("KV restore failed: {err}"));
+            return false;
+        }
         self.active_seq_id = Some(seq_id.to_string());
 
         self.recount_kv_bytes();
@@ -1546,6 +1572,7 @@ impl InferenceEngine {
             .total_kv_swap_count
             .fetch_add(1, Ordering::Relaxed);
         debug!(id = %seq_id, "swap_in complete");
+        true
     }
 
     /// Mark that the model finished processing `seq_id` for this scheduling
@@ -1762,7 +1789,115 @@ impl InferenceEngine {
 #[cfg(test)]
 mod tests {
     use super::{is_probable_oom, should_reject_text_prefill_request, MemoryConfig};
+    use crate::engine::runtime::{LayerKvCaches, RuntimeModel, RuntimeStepOutput};
+    use crate::engine::sequence::{Sequence, SequenceStatus};
+    use crate::engine::types::EngineResponse;
     use crate::engine::types::MultimodalInputs;
+    use candle_core::{DType, Device, Tensor};
+    use candle_transformers::generation::LogitsProcessor;
+    use tokenizers::models::bpe::BPE;
+    use tokio::sync::mpsc;
+
+    struct MockRuntimeModel {
+        device: Device,
+        tokenizer: tokenizers::Tokenizer,
+        extract_err: Option<String>,
+        restore_err: Option<String>,
+    }
+
+    impl MockRuntimeModel {
+        fn new(extract_err: Option<&str>, restore_err: Option<&str>) -> Self {
+            Self {
+                device: Device::Cpu,
+                tokenizer: tokenizers::Tokenizer::new(BPE::default()),
+                extract_err: extract_err.map(str::to_string),
+                restore_err: restore_err.map(str::to_string),
+            }
+        }
+    }
+
+    impl RuntimeModel for MockRuntimeModel {
+        fn prefill(
+            &mut self,
+            _ctx: crate::engine::runtime::RuntimeRequestContext,
+        ) -> anyhow::Result<RuntimeStepOutput> {
+            panic!("not used in swap_in tests")
+        }
+
+        fn decode(
+            &mut self,
+            _ctx: crate::engine::runtime::RuntimeStepContext,
+        ) -> anyhow::Result<RuntimeStepOutput> {
+            panic!("not used in swap_in tests")
+        }
+
+        fn batch_decode(
+            &mut self,
+            _ctx: crate::engine::runtime::BatchDecodeContext<'_>,
+        ) -> candle_core::Result<Tensor> {
+            panic!("not used in swap_in tests")
+        }
+
+        fn clear_kv_cache(&mut self) {}
+        fn num_layers(&self) -> usize {
+            1
+        }
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn dtype(&self) -> DType {
+            DType::BF16
+        }
+        fn tokenizer(&self) -> &tokenizers::Tokenizer {
+            &self.tokenizer
+        }
+        fn eos_token_id(&self) -> Vec<u32> {
+            vec![0]
+        }
+        fn warmup(&mut self) {}
+        fn supports_kv_swap(&self) -> bool {
+            true
+        }
+        fn kv_extract(&self) -> anyhow::Result<LayerKvCaches> {
+            match &self.extract_err {
+                Some(err) => Err(anyhow::anyhow!(err.clone())),
+                None => Ok(vec![None]),
+            }
+        }
+        fn kv_restore(&mut self, _caches: LayerKvCaches) -> anyhow::Result<()> {
+            match &self.restore_err {
+                Some(err) => Err(anyhow::anyhow!(err.clone())),
+                None => Ok(()),
+            }
+        }
+        fn kv_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    fn make_test_sequence(id: &str) -> (Sequence, mpsc::UnboundedReceiver<EngineResponse>) {
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        (
+            Sequence {
+                id: id.to_string(),
+                status: SequenceStatus::Running,
+                tokens: vec![1, 2],
+                multimodal_inputs: MultimodalInputs::default(),
+                prompt_len: 1,
+                kv_caches: vec![None],
+                logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
+                temperature: Some(0.8),
+                top_p: Some(0.95),
+                top_k: Some(40),
+                max_tokens: 16,
+                eos_token_id: vec![0],
+                repetition_penalty: 1.0,
+                repeat_last_n: 64,
+                response_tx,
+            },
+            response_rx,
+        )
+    }
 
     #[test]
     fn parse_text_prefill_token_limit_env_accepts_positive_integer() {
@@ -1834,5 +1969,63 @@ mod tests {
         assert!(!is_probable_oom(
             "dtype mismatch in mul, lhs: BF16, rhs: F32"
         ));
+    }
+
+    #[test]
+    fn swap_in_restore_failure_sends_error_and_cleans_sequence() {
+        let model = Box::new(MockRuntimeModel::new(
+            None,
+            Some("corrupt int8_rowwise_kv payload"),
+        ));
+        let (mut engine, _handle) = super::InferenceEngine::new(
+            model,
+            1,
+            1,
+            super::PlacementPolicy::KeepOnDevice,
+            MemoryConfig::parse(0, None, &Device::Cpu),
+        );
+        let (seq, mut rx) = make_test_sequence("seq-restore");
+        engine.sequences.insert(seq.id.clone(), seq);
+
+        assert!(!engine.swap_in("seq-restore"));
+        assert!(engine.active_seq_id.is_none());
+        assert!(!engine.sequences.contains_key("seq-restore"));
+        match rx.try_recv().unwrap() {
+            EngineResponse::Error(message) => {
+                assert!(message.contains("KV restore failed"));
+                assert!(message.contains("corrupt int8_rowwise_kv payload"));
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn swap_in_export_failure_only_fails_previous_sequence() {
+        let model = Box::new(MockRuntimeModel::new(Some("export decode failure"), None));
+        let (mut engine, _handle) = super::InferenceEngine::new(
+            model,
+            1,
+            1,
+            super::PlacementPolicy::KeepOnDevice,
+            MemoryConfig::parse(0, None, &Device::Cpu),
+        );
+        let (prev_seq, mut prev_rx) = make_test_sequence("seq-prev");
+        let (next_seq, mut next_rx) = make_test_sequence("seq-next");
+        engine.sequences.insert(prev_seq.id.clone(), prev_seq);
+        engine.sequences.insert(next_seq.id.clone(), next_seq);
+        engine.active_seq_id = Some("seq-prev".to_string());
+
+        assert!(engine.swap_in("seq-next"));
+        assert_eq!(engine.active_seq_id.as_deref(), Some("seq-next"));
+        assert!(!engine.sequences.contains_key("seq-prev"));
+        assert!(engine.sequences.contains_key("seq-next"));
+        match prev_rx.try_recv().unwrap() {
+            EngineResponse::Error(message) => {
+                assert!(message.contains("KV export failed"));
+                assert!(message.contains("export decode failure"));
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+        assert!(next_rx.try_recv().is_err());
     }
 }

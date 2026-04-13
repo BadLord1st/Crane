@@ -7,6 +7,23 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_b as linear, Activation, Linear, VarBuilder};
 use tracing::debug;
 
+pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
+    fn score_prefix_keys(
+        &self,
+        layer_idx: usize,
+        query_states: &Tensor,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+    ) -> candle_core::Result<Option<Tensor>>;
+
+    fn value_prefix(
+        &self,
+        layer_idx: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> candle_core::Result<Option<Tensor>>;
+}
+
 fn gemma4_perf_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -572,6 +589,7 @@ enum KvCache {
 
 #[derive(Debug, Clone)]
 struct Attention {
+    layer_idx: usize,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Option<Linear>,
@@ -639,6 +657,7 @@ impl Attention {
         )?);
 
         Ok(Self {
+            layer_idx,
             q_proj,
             k_proj,
             v_proj,
@@ -661,6 +680,7 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         shared_kv: Option<(&Tensor, &Tensor)>,
+        decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -717,10 +737,32 @@ impl Attention {
         };
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        let mut value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
         // Gemma4 text eager-attention path uses scaling=1.0.
-        let attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
+        let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
+
+        if b_sz == 1 && q_len == 1 && shared_kv.is_none() {
+            if let Some(prefix_kv) = decode_prefix_kv {
+                if let (Some(prefix_scores), Some(prefix_values)) = (
+                    prefix_kv.score_prefix_keys(
+                        self.layer_idx,
+                        &query_states,
+                        self.num_kv_heads,
+                        self.num_kv_groups,
+                    )?,
+                    prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?,
+                ) {
+                    let prefix_scores = prefix_scores
+                        .to_device(query_states.device())?
+                        .to_dtype(query_states.dtype())?;
+                    let prefix_values =
+                        repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
+                    attn_weights = Tensor::cat(&[&prefix_scores, &attn_weights], D::Minus1)?;
+                    value_states = Tensor::cat(&[&prefix_values, &value_states], 2)?;
+                }
+            }
+        }
 
         let attn_weights = match attention_mask {
             None => attn_weights,
@@ -778,6 +820,39 @@ impl Attention {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Debug)]
+    struct DummyDecodePrefixKvSource {
+        calls: Arc<AtomicUsize>,
+        scores: Tensor,
+        values: Tensor,
+    }
+
+    impl DecodePrefixKvSource for DummyDecodePrefixKvSource {
+        fn score_prefix_keys(
+            &self,
+            _layer_idx: usize,
+            _query_states: &Tensor,
+            _num_kv_heads: usize,
+            _num_kv_groups: usize,
+        ) -> candle_core::Result<Option<Tensor>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.scores.clone()))
+        }
+
+        fn value_prefix(
+            &self,
+            _layer_idx: usize,
+            _target_device: &Device,
+            _target_dtype: DType,
+        ) -> candle_core::Result<Option<Tensor>> {
+            Ok(Some(self.values.clone()))
+        }
+    }
 
     fn test_config(attention_k_eq_v: bool) -> Config {
         Config {
@@ -840,6 +915,42 @@ mod tests {
             Tensor::ones(2, DType::F32, &device)?,
         );
 
+        Ok(tensors)
+    }
+
+    fn prefix_path_tensor_map() -> candle_core::Result<HashMap<String, Tensor>> {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "q_proj.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "k_proj.weight".to_string(),
+            Tensor::zeros((2, 4), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "v_proj.weight".to_string(),
+            Tensor::zeros((2, 4), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "o_proj.weight".to_string(),
+            Tensor::from_vec(
+                vec![
+                    1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                ],
+                (4, 4),
+                &device,
+            )?,
+        );
+        tensors.insert(
+            "q_norm.weight".to_string(),
+            Tensor::ones(2, DType::F32, &device)?,
+        );
+        tensors.insert(
+            "k_norm.weight".to_string(),
+            Tensor::ones(2, DType::F32, &device)?,
+        );
         Ok(tensors)
     }
 
@@ -911,7 +1022,7 @@ mod tests {
             Tensor::ones((1, 2, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
 
         let (output, produced_kv) = attention
-            .forward(&xs, None, 0, None)
+            .forward(&xs, None, 0, None, None)
             .expect("forward should reuse k projection as v");
 
         assert_eq!(
@@ -1001,6 +1112,105 @@ mod tests {
         assert_eq!(weights_t.dtype(), DType::BF16);
         assert_eq!(scaled.dtype(), DType::BF16);
         assert_eq!(scaled.dims2().expect("scaled dims"), (2, 4));
+    }
+
+    #[test]
+    fn attention_decode_uses_prefix_scores_for_single_token_decode() {
+        let cfg = test_config(false);
+        let vb = VarBuilder::from_tensors(
+            prefix_path_tensor_map().expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let mut attention = Attention::new(&cfg, 0, vb).expect("attention should build");
+        let xs =
+            Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prefix = DummyDecodePrefixKvSource {
+            calls: calls.clone(),
+            scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
+                .expect("prefix scores"),
+            values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
+                .expect("prefix values"),
+        };
+
+        let (output, _) = attention
+            .forward(&xs, None, 0, None, Some(&prefix))
+            .expect("decode should use prefix path");
+        let output = output
+            .to_dtype(DType::F32)
+            .expect("output dtype")
+            .to_vec3::<f32>()
+            .expect("output vec");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output[0][0], vec![3.0, 4.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn attention_decode_prefix_falls_back_for_multi_token_queries() {
+        let cfg = test_config(false);
+        let vb = VarBuilder::from_tensors(
+            prefix_path_tensor_map().expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let mut attention = Attention::new(&cfg, 0, vb).expect("attention should build");
+        let xs =
+            Tensor::ones((1, 2, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prefix = DummyDecodePrefixKvSource {
+            calls: calls.clone(),
+            scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
+                .expect("prefix scores"),
+            values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
+                .expect("prefix values"),
+        };
+
+        let (output, _) = attention
+            .forward(&xs, None, 0, None, Some(&prefix))
+            .expect("multi-token path should fall back safely");
+        let output = output
+            .to_dtype(DType::F32)
+            .expect("output dtype")
+            .to_vec3::<f32>()
+            .expect("output vec");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(output, vec![vec![vec![0.0; 4], vec![0.0; 4]]]);
+    }
+
+    #[test]
+    fn attention_decode_prefix_falls_back_for_batch_decode() {
+        let cfg = test_config(false);
+        let vb = VarBuilder::from_tensors(
+            prefix_path_tensor_map().expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let mut attention = Attention::new(&cfg, 0, vb).expect("attention should build");
+        let xs =
+            Tensor::ones((2, 1, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prefix = DummyDecodePrefixKvSource {
+            calls: calls.clone(),
+            scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
+                .expect("prefix scores"),
+            values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
+                .expect("prefix values"),
+        };
+
+        let (output, _) = attention
+            .forward(&xs, None, 0, None, Some(&prefix))
+            .expect("batch decode should fall back safely");
+        let output = output
+            .to_dtype(DType::F32)
+            .expect("output dtype")
+            .to_vec3::<f32>()
+            .expect("output vec");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(output, vec![vec![vec![0.0; 4]], vec![vec![0.0; 4]]]);
     }
 }
 
@@ -1141,6 +1351,7 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         shared_kv: Option<(&Tensor, &Tensor)>,
+        decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let perf_enabled = gemma4_perf_enabled();
         let q_len = if perf_enabled { xs.dim(1)? } else { 0 };
@@ -1151,9 +1362,13 @@ impl DecoderLayer {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let t_attn = perf_enabled.then(Instant::now);
-        let (xs, produced_kv) =
-            self.self_attn
-                .forward(&xs, attention_mask, seqlen_offset, shared_kv)?;
+        let (xs, produced_kv) = self.self_attn.forward(
+            &xs,
+            attention_mask,
+            seqlen_offset,
+            shared_kv,
+            decode_prefix_kv,
+        )?;
         if let Some(t_attn) = t_attn {
             attn_us = t_attn.elapsed().as_micros() as u64;
         }
@@ -1297,6 +1512,7 @@ pub struct Gemma4TextModel {
     hidden_size: usize,
     hidden_size_per_layer_input: usize,
     shared_kv_source: Vec<Option<usize>>,
+    decode_prefix_kv_source: Option<Arc<dyn DecodePrefixKvSource>>,
 }
 
 impl Gemma4TextModel {
@@ -1373,7 +1589,19 @@ impl Gemma4TextModel {
             hidden_size: cfg.hidden_size,
             hidden_size_per_layer_input,
             shared_kv_source,
+            decode_prefix_kv_source: None,
         })
+    }
+
+    pub fn set_decode_prefix_kv_source(
+        &mut self,
+        decode_prefix_kv_source: Option<Arc<dyn DecodePrefixKvSource>>,
+    ) {
+        self.decode_prefix_kv_source = decode_prefix_kv_source;
+    }
+
+    pub fn has_shared_kv_layers(&self) -> bool {
+        self.shared_kv_source.iter().any(Option::is_some)
     }
 
     fn create_attention_masks(
@@ -1481,6 +1709,7 @@ impl Gemma4TextModel {
                 mask.as_ref(),
                 seqlen_offset,
                 shared_kv,
+                self.decode_prefix_kv_source.as_deref(),
             )?;
             xs = new_xs;
             produced_layer_kv[layer_idx] = produced_kv;
@@ -1587,5 +1816,12 @@ impl Gemma4TextModel {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
             layer.self_attn.restore_kv_cache(cache);
         }
+    }
+
+    pub fn layer_uses_sliding_window(&self, layer_idx: usize) -> bool {
+        self.layers
+            .get(layer_idx)
+            .map(|layer| layer.is_sliding)
+            .unwrap_or(false)
     }
 }

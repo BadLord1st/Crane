@@ -395,6 +395,25 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
     }
 }
 
+fn validate_kv_backend_mode(
+    model_type: ModelType,
+    kv_backend_config: KvBackendConfig,
+) -> Result<()> {
+    match kv_backend_config.mode {
+        super::runtime::KvCacheMode::TurboQuant if !matches!(model_type, ModelType::Gemma4) => {
+            anyhow::bail!(
+                "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
+            )
+        }
+        super::runtime::KvCacheMode::Int8RowwiseKv if !matches!(model_type, ModelType::Gemma4) => {
+            anyhow::bail!(
+                "KV cache mode 'int8_rowwise_kv' is currently supported only for Gemma4 runtime adapters"
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn create_runtime_model(
     model_type: ModelType,
     model_path: &str,
@@ -404,16 +423,9 @@ pub fn create_runtime_model(
     kv_backend_config: KvBackendConfig,
 ) -> Result<Box<dyn RuntimeModel>> {
     let model_type = resolve(model_type, model_path);
+    validate_kv_backend_mode(model_type, kv_backend_config)?;
     match model_type {
         ModelType::HunyuanDense => {
-            if matches!(
-                kv_backend_config.mode,
-                super::runtime::KvCacheMode::TurboQuant
-            ) {
-                anyhow::bail!(
-                    "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
-                );
-            }
             let hy_fmt = match format {
                 ModelFormat::Safetensors => {
                     crane_core::models::hunyuan_dense::ModelFormat::Safetensors
@@ -425,19 +437,9 @@ pub fn create_runtime_model(
                 model_path, device, dtype, hy_fmt,
             )?))
         }
-        ModelType::Qwen25 => {
-            if matches!(
-                kv_backend_config.mode,
-                super::runtime::KvCacheMode::TurboQuant
-            ) {
-                anyhow::bail!(
-                    "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
-                );
-            }
-            Ok(Box::new(Qwen25RuntimeAdapter::new(
-                model_path, device, dtype,
-            )?))
-        }
+        ModelType::Qwen25 => Ok(Box::new(Qwen25RuntimeAdapter::new(
+            model_path, device, dtype,
+        )?)),
         // Phase 3 reference path: Gemma4 runs on a native RuntimeModel adapter.
         ModelType::Gemma4 => {
             if matches!(format, ModelFormat::Gguf) {
@@ -450,41 +452,15 @@ pub fn create_runtime_model(
                 kv_backend_config,
             )?))
         }
-        ModelType::Qwen3 => {
-            if matches!(
-                kv_backend_config.mode,
-                super::runtime::KvCacheMode::TurboQuant
-            ) {
-                anyhow::bail!(
-                    "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
-                );
-            }
-            Ok(Box::new(Qwen3RuntimeAdapter::new(
-                model_path, device, dtype,
-            )?))
-        }
+        ModelType::Qwen3 => Ok(Box::new(Qwen3RuntimeAdapter::new(
+            model_path, device, dtype,
+        )?)),
         ModelType::PaddleOcrVl => {
-            if matches!(
-                kv_backend_config.mode,
-                super::runtime::KvCacheMode::TurboQuant
-            ) {
-                anyhow::bail!(
-                    "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
-                );
-            }
             anyhow::bail!(
                 "PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_runtime_model()"
             )
         }
         ModelType::Qwen3TTS => {
-            if matches!(
-                kv_backend_config.mode,
-                super::runtime::KvCacheMode::TurboQuant
-            ) {
-                anyhow::bail!(
-                    "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
-                );
-            }
             anyhow::bail!(
                 "Qwen3-TTS is a TTS model — use create_tts_model() instead of create_runtime_model()"
             )
@@ -721,6 +697,47 @@ mod tests {
     fn resolve_explicit_type_is_passthrough() {
         let result = resolve(ModelType::HunyuanDense, "/models/whatever");
         assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn validate_kv_backend_mode_allows_turboquant_for_gemma4() {
+        validate_kv_backend_mode(
+            ModelType::Gemma4,
+            KvBackendConfig {
+                mode: crate::engine::runtime::KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("gemma4 should accept turboquant mode");
+    }
+
+    #[test]
+    fn validate_kv_backend_mode_restricts_turboquant_to_gemma4() {
+        let err = validate_kv_backend_mode(
+            ModelType::Qwen3,
+            KvBackendConfig {
+                mode: crate::engine::runtime::KvCacheMode::TurboQuant,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains(
+            "KV cache mode 'turboquant' is currently supported only for Gemma4 runtime adapters"
+        ));
+    }
+
+    #[test]
+    fn validate_kv_backend_mode_restricts_int8_rowwise_kv_to_gemma4() {
+        let err = validate_kv_backend_mode(
+            ModelType::Qwen3,
+            KvBackendConfig {
+                mode: crate::engine::runtime::KvCacheMode::Int8RowwiseKv,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains(
+            "KV cache mode 'int8_rowwise_kv' is currently supported only for Gemma4 runtime adapters"
+        ));
     }
 
     #[test]

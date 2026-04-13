@@ -100,6 +100,8 @@ struct Args {
     placement_policy: PlacementMode,
 
     /// KV cache storage backend. CLI overrides CRANE_KV_CACHE_MODE.
+    /// Default: bf16_dense. Current quantized placeholder: int8_rowwise_kv.
+    /// turboquant currently enables a narrow Gemma4 decode path with safe fallback.
     #[arg(long)]
     kv_cache_mode: Option<String>,
 }

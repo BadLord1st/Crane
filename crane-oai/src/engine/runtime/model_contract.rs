@@ -55,11 +55,13 @@ pub trait RuntimeModel: Send + 'static {
         false
     }
 
-    fn kv_extract(&self) -> LayerKvCaches {
-        vec![]
+    fn kv_extract(&self) -> Result<LayerKvCaches> {
+        Ok(vec![])
     }
 
-    fn kv_restore(&mut self, _caches: LayerKvCaches) {}
+    fn kv_restore(&mut self, _caches: LayerKvCaches) -> Result<()> {
+        Ok(())
+    }
 
     fn kv_bytes(&self) -> u64 {
         0

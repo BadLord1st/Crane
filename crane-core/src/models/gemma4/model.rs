@@ -4,9 +4,10 @@ use candle_nn::{Activation, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-use super::modeling::{Config, Gemma4TextModel};
+use super::modeling::{Config, DecodePrefixKvSource, Gemma4TextModel};
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
 
@@ -986,6 +987,22 @@ impl Model {
 
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         self.inner.set_kv_caches(caches);
+    }
+
+    pub fn set_decode_prefix_kv_source(
+        &mut self,
+        decode_prefix_kv_source: Option<Arc<dyn DecodePrefixKvSource>>,
+    ) {
+        self.inner
+            .set_decode_prefix_kv_source(decode_prefix_kv_source);
+    }
+
+    pub fn has_shared_kv_layers(&self) -> bool {
+        self.inner.has_shared_kv_layers()
+    }
+
+    pub fn layer_uses_sliding_window(&self, layer_idx: usize) -> bool {
+        self.inner.layer_uses_sliding_window(layer_idx)
     }
 
     pub fn active_kv_cache_bytes(&self) -> u64 {

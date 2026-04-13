@@ -7,9 +7,9 @@ pub mod request_state;
 pub mod scheduler;
 
 pub use kv_backend::{
-    make_kv_backend, Bf16PassthroughBackend, DenseLayerKv, KvBackendConfig, KvCacheBackend,
-    KvCacheMode, KvEncodedPayloadEncoding, KvLayerEnvelope, LayerKvCaches, SequenceKvCaches,
-    TurboQuantBackend,
+    make_kv_backend, Bf16PassthroughBackend, DenseLayerKv, Int8RowwiseKvBackend, KvBackendConfig,
+    KvCacheBackend, KvCacheMode, KvEncodedPayloadEncoding, KvLayerEnvelope, LayerKvCaches,
+    SequenceKvCaches,
 };
 pub use model_contract::{
     BatchDecodeContext, RuntimeModel, RuntimeRequestContext, RuntimeStateDelta, RuntimeStepContext,
