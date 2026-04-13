@@ -1,8 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_b as linear, Activation, Linear, VarBuilder};
+use tracing::debug;
+
+fn gemma4_perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CRANE_GEMMA4_PERF").ok().as_deref(),
+            Some("1")
+        )
+    })
+}
 
 fn repeat_kv(xs: Tensor, n_rep: usize) -> candle_core::Result<Tensor> {
     if n_rep == 1 {
@@ -915,6 +928,7 @@ mod tests {
 
 #[derive(Debug, Clone)]
 struct DecoderLayer {
+    layer_idx: usize,
     self_attn: Attention,
     mlp: MLP,
     router: Option<Gemma4TextRouter>,
@@ -1021,6 +1035,7 @@ impl DecoderLayer {
         };
 
         Ok(Self {
+            layer_idx,
             self_attn,
             mlp,
             router,
@@ -1049,17 +1064,31 @@ impl DecoderLayer {
         seqlen_offset: usize,
         shared_kv: Option<(&Tensor, &Tensor)>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let perf_enabled = gemma4_perf_enabled();
+        let q_len = if perf_enabled { xs.dim(1)? } else { 0 };
+        let mut attn_us = 0u64;
+        let mut router_us = 0u64;
+        let mut experts_us = 0u64;
+        let mut mlp_us = 0u64;
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
+        let t_attn = perf_enabled.then(Instant::now);
         let (xs, produced_kv) =
             self.self_attn
                 .forward(&xs, attention_mask, seqlen_offset, shared_kv)?;
+        if let Some(t_attn) = t_attn {
+            attn_us = t_attn.elapsed().as_micros() as u64;
+        }
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = (xs + residual)?;
 
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+        let t_mlp = perf_enabled.then(Instant::now);
         let mut xs = xs.apply(&self.mlp)?;
+        if let Some(t_mlp) = t_mlp {
+            mlp_us = t_mlp.elapsed().as_micros() as u64;
+        }
 
         if let (Some(router), Some(experts), Some(pre_ff2), Some(post_ff1), Some(post_ff2)) = (
             self.router.as_ref(),
@@ -1070,10 +1099,18 @@ impl DecoderLayer {
         ) {
             let (b, s, h) = residual.dims3()?;
             let residual_flat = residual.reshape((b * s, h))?;
+            let t_router = perf_enabled.then(Instant::now);
             let routes = router.route(&residual_flat)?;
+            if let Some(t_router) = t_router {
+                router_us = t_router.elapsed().as_micros() as u64;
+            }
 
             let moe_in = residual_flat.apply(pre_ff2)?;
+            let t_experts = perf_enabled.then(Instant::now);
             let moe_out = experts.forward(&moe_in, &routes)?;
+            if let Some(t_experts) = t_experts {
+                experts_us = t_experts.elapsed().as_micros() as u64;
+            }
             let moe_out = moe_out.reshape((b, s, h))?.apply(post_ff2)?;
 
             let mlp_out = xs.apply(post_ff1)?;
@@ -1100,6 +1137,20 @@ impl DecoderLayer {
             let x_gate = x_gate.apply(per_layer_projection)?;
             let x_gate = x_gate.apply(post_per_layer_input_norm)?;
             xs = (residual + x_gate)?;
+        }
+
+        if perf_enabled {
+            debug!(
+                layer_idx = self.layer_idx,
+                is_sliding = self.is_sliding,
+                attn_us,
+                router_us,
+                experts_us,
+                mlp_us,
+                q_len,
+                seqlen_offset,
+                "gemma4_decode_layer_perf",
+            );
         }
 
         Ok((xs.broadcast_mul(&self.layer_scalar)?, produced_kv))

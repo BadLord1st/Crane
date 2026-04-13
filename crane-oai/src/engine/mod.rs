@@ -1256,6 +1256,10 @@ impl InferenceEngine {
     fn step_decode_sequential(&mut self, batch: Vec<String>) {
         let t0 = Instant::now();
         let mut total_tokens: u64 = 0;
+        let mut swap_in_us: u64 = 0;
+        let mut forward_us: u64 = 0;
+        let mut sample_us: u64 = 0;
+        let mut swap_out_us: u64 = 0;
 
         debug!(batch_size = batch.len(), batch = ?batch, "Starting sequential decode");
 
@@ -1272,7 +1276,9 @@ impl InferenceEngine {
                 continue;
             }
 
+            let t_swap_in = Instant::now();
             self.swap_in(seq_id);
+            swap_in_us += t_swap_in.elapsed().as_micros() as u64;
 
             debug!(id = %seq_id, "Sequential decode sequence activated");
 
@@ -1291,6 +1297,7 @@ impl InferenceEngine {
                     (input_ids, seq.start_pos())
                 };
 
+                let t_forward = Instant::now();
                 let logits = match self.model.decode(RuntimeStepContext {
                     input_ids,
                     start_pos,
@@ -1301,7 +1308,9 @@ impl InferenceEngine {
                         break;
                     }
                 };
+                forward_us += t_forward.elapsed().as_micros() as u64;
 
+                let t_sample = Instant::now();
                 let next_token = {
                     let seq = self.sequences.get_mut(seq_id).unwrap();
                     match sampling::sample(seq_id, seq, &logits, &mut self.sampling_buffers) {
@@ -1312,6 +1321,7 @@ impl InferenceEngine {
                         }
                     }
                 };
+                sample_us += t_sample.elapsed().as_micros() as u64;
 
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
@@ -1346,7 +1356,9 @@ impl InferenceEngine {
                 }
             }
 
+            let t_swap_out = Instant::now();
             self.swap_out(seq_id);
+            swap_out_us += t_swap_out.elapsed().as_micros() as u64;
         }
 
         let decode_us = t0.elapsed().as_micros() as u64;
@@ -1365,6 +1377,17 @@ impl InferenceEngine {
                 decode_ms = decode_us / 1000,
                 tok_s = format!("{:.1}", tok_s),
                 "Sequential decode step complete",
+            );
+            info!(
+                tokens = total_tokens,
+                decode_ms = decode_us as f64 / 1_000.0,
+                tok_s,
+                swap_in_us,
+                forward_us,
+                sample_us,
+                swap_out_us,
+                seq_count = batch.len(),
+                "decode_perf_sequential",
             );
         }
 
