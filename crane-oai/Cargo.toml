@@ -31,4 +31,5 @@ cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
 
 [dev-dependencies]
+safetensors = "0.4.5"
 tempfile = "3"

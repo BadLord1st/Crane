@@ -111,6 +111,39 @@ impl DecodePrefixKvSource for Gemma4TurboQuantDecodePrefix {
         };
         Ok(Some(value))
     }
+
+    fn weighted_value_prefix(
+        &self,
+        layer_idx: usize,
+        attn_weights: &Tensor,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> candle_core::Result<Option<Tensor>> {
+        if !self.enabled_layers.get(layer_idx).copied().unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let Some(stored) = self
+            .caches
+            .get(layer_idx)
+            .and_then(|stored| stored.as_ref())
+        else {
+            return Ok(None);
+        };
+
+        self.backend
+            .weighted_value_prefix(
+                attn_weights,
+                stored,
+                num_kv_heads,
+                num_kv_groups,
+                target_device,
+                target_dtype,
+            )
+            .map_err(|err| candle_core::Error::Msg(err.to_string()))
+    }
 }
 
 pub struct Gemma4RuntimeAdapter {
@@ -355,10 +388,16 @@ mod tests {
     use super::*;
     use crate::engine::runtime::kv_backend::{KvLayerPayload, TurboQuantValuePayload};
     use crate::engine::runtime::KvCacheMode;
+    use crate::engine::types::MultimodalInputs;
     use candle_nn::{Activation, VarBuilder};
     use crane_core::models::gemma4::modeling::{Config, Gemma4TextModel};
+    use crane_core::models::gemma4::Model as Gemma4Model;
+    use safetensors::{serialize_to_file, Dtype as SafeDtype, View};
+    use std::borrow::Cow;
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     fn dense_scores(query_rows: &[Vec<f32>], key_rows: &[Vec<f32>]) -> Vec<Vec<f32>> {
         query_rows
@@ -416,6 +455,8 @@ mod tests {
     struct CountingDecodePrefixKvSource {
         inner: Arc<Gemma4TurboQuantDecodePrefix>,
         score_calls_by_layer: Arc<Mutex<Vec<usize>>>,
+        weighted_value_calls_by_layer: Arc<Mutex<Vec<usize>>>,
+        dense_value_calls_by_layer: Arc<Mutex<Vec<usize>>>,
     }
 
     impl DecodePrefixKvSource for CountingDecodePrefixKvSource {
@@ -445,8 +486,45 @@ mod tests {
             target_device: &Device,
             target_dtype: DType,
         ) -> candle_core::Result<Option<Tensor>> {
+            let mut dense_value_calls = self
+                .dense_value_calls_by_layer
+                .lock()
+                .expect("dense value calls mutex poisoned");
+            *dense_value_calls
+                .get_mut(layer_idx)
+                .expect("layer index should exist") += 1;
+            drop(dense_value_calls);
+
             self.inner
                 .value_prefix(layer_idx, target_device, target_dtype)
+        }
+
+        fn weighted_value_prefix(
+            &self,
+            layer_idx: usize,
+            attn_weights: &Tensor,
+            num_kv_heads: usize,
+            num_kv_groups: usize,
+            target_device: &Device,
+            target_dtype: DType,
+        ) -> candle_core::Result<Option<Tensor>> {
+            let mut weighted_value_calls = self
+                .weighted_value_calls_by_layer
+                .lock()
+                .expect("weighted value calls mutex poisoned");
+            *weighted_value_calls
+                .get_mut(layer_idx)
+                .expect("layer index should exist") += 1;
+            drop(weighted_value_calls);
+
+            self.inner.weighted_value_prefix(
+                layer_idx,
+                attn_weights,
+                num_kv_heads,
+                num_kv_groups,
+                target_device,
+                target_dtype,
+            )
         }
     }
 
@@ -625,6 +703,310 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
+    fn top_k_indices(values: &[f32], k: usize) -> Vec<usize> {
+        let mut indexed = values.iter().copied().enumerate().collect::<Vec<_>>();
+        indexed.sort_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
+            rhs.partial_cmp(lhs)
+                .expect("finite logits")
+                .then_with(|| lhs_idx.cmp(rhs_idx))
+        });
+        indexed.into_iter().take(k).map(|(idx, _)| idx).collect()
+    }
+
+    fn tensor_to_vec_f32(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .flatten_all()
+            .expect("flatten tensor")
+            .to_dtype(DType::F32)
+            .expect("tensor to f32")
+            .to_vec1::<f32>()
+            .expect("tensor vec")
+    }
+
+    #[derive(Clone)]
+    struct OwnedTensorView {
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl View for OwnedTensorView {
+        fn dtype(&self) -> SafeDtype {
+            SafeDtype::F32
+        }
+
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+
+        fn data(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(&self.data)
+        }
+
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    fn owned_tensor_view(tensor: &Tensor) -> OwnedTensorView {
+        let shape = tensor.shape().dims().to_vec();
+        let values = tensor
+            .flatten_all()
+            .expect("flatten checkpoint tensor")
+            .to_dtype(DType::F32)
+            .expect("checkpoint tensor to f32")
+            .to_vec1::<f32>()
+            .expect("checkpoint tensor vec");
+        let mut data = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        OwnedTensorView { shape, data }
+    }
+
+    fn tiny_decode_logit_tokenizer_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<unk>": 0,
+                    "tok1": 1,
+                    "tok2": 2,
+                    "tok3": 3,
+                    "tok4": 4,
+                    "tok5": 5,
+                    "tok6": 6,
+                    "tok7": 7
+                },
+                "unk_token": "<unk>"
+            }
+        })
+    }
+
+    fn tiny_decode_logit_config_json(num_hidden_layers: usize) -> serde_json::Value {
+        serde_json::json!({
+            "text_config": {
+                "attention_bias": false,
+                "attention_k_eq_v": false,
+                "head_dim": 2,
+                "hidden_activation": "silu",
+                "hidden_size": 4,
+                "intermediate_size": 8,
+                "num_attention_heads": 2,
+                "num_hidden_layers": num_hidden_layers,
+                "num_key_value_heads": 1,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 8,
+                "max_position_embeddings": 16,
+                "sliding_window": 8,
+                "layer_types": vec!["full_attention"; num_hidden_layers],
+                "enable_moe_block": false
+            },
+            "eos_token_id": [7]
+        })
+    }
+
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(value).expect("serialize json fixture"),
+        )
+        .expect("write json fixture");
+    }
+
+    fn write_tiny_gemma4_checkpoint_fixture(num_hidden_layers: usize) -> TempDir {
+        // This is the closest repo-backed runtime fixture available: a tiny on-disk Gemma4
+        // checkpoint exercising Model::new + safetensors/tokenizer/config loading, not a
+        // production Gemma4 checkpoint snapshot.
+        let dir = tempfile::tempdir().expect("checkpoint tempdir");
+        write_json(
+            &dir.path().join("tokenizer.json"),
+            &tiny_decode_logit_tokenizer_json(),
+        );
+        write_json(
+            &dir.path().join("config.json"),
+            &tiny_decode_logit_config_json(num_hidden_layers),
+        );
+
+        let mut entries = tiny_decode_logit_tensor_map(num_hidden_layers)
+            .expect("tiny decode tensor map")
+            .into_iter()
+            .map(|(name, tensor)| {
+                (
+                    format!("model.language_model.{name}"),
+                    owned_tensor_view(&tensor),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        serialize_to_file(entries, &None, &dir.path().join("model.safetensors"))
+            .expect("serialize safetensors checkpoint");
+        dir
+    }
+
+    struct RuntimeCheckpointFixture {
+        _dir: TempDir,
+        model_path: PathBuf,
+        prompt_text: &'static str,
+    }
+
+    const DEFAULT_REAL_GEMMA4_CHECKPOINT_PATH: &str =
+        "/models/google/gemma-4-26B-A4B-it/1db3cff1840c2ae59759d8e842ff37831cf8cb63";
+    const DEFAULT_REAL_GEMMA4_PARITY_PROMPT: &str = "Write one short sentence about cranes.";
+    const DEFAULT_REAL_GEMMA4_PARITY_STEPS: usize = 4;
+
+    impl RuntimeCheckpointFixture {
+        fn new(num_hidden_layers: usize) -> Self {
+            let dir = write_tiny_gemma4_checkpoint_fixture(num_hidden_layers);
+            let model_path = dir.path().to_path_buf();
+            Self {
+                _dir: dir,
+                model_path,
+                prompt_text: "tok1 tok2",
+            }
+        }
+
+        fn path_str(&self) -> &str {
+            self.model_path.to_str().expect("utf8 temp path")
+        }
+    }
+
+    struct RealCheckpointHarnessConfig {
+        model_path: PathBuf,
+        prompt_text: String,
+        decode_steps: usize,
+    }
+
+    impl RealCheckpointHarnessConfig {
+        fn from_env() -> Self {
+            let model_path = std::env::var("CRANE_GEMMA4_REAL_CHECKPOINT")
+                .unwrap_or_else(|_| DEFAULT_REAL_GEMMA4_CHECKPOINT_PATH.to_string());
+            let prompt_text = std::env::var("CRANE_GEMMA4_REAL_PARITY_PROMPT")
+                .unwrap_or_else(|_| DEFAULT_REAL_GEMMA4_PARITY_PROMPT.to_string());
+            let decode_steps = std::env::var("CRANE_GEMMA4_REAL_PARITY_STEPS")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|steps| *steps > 0)
+                .unwrap_or(DEFAULT_REAL_GEMMA4_PARITY_STEPS);
+            Self {
+                model_path: PathBuf::from(model_path),
+                prompt_text,
+                decode_steps,
+            }
+        }
+
+        fn path_str(&self) -> &str {
+            self.model_path.to_str().expect("utf8 real checkpoint path")
+        }
+
+        fn require_accessible_path(&self) {
+            assert!(
+                self.model_path.exists(),
+                "real Gemma4 checkpoint path '{}' is not accessible. Set CRANE_GEMMA4_REAL_CHECKPOINT to a mounted snapshot path before running this ignored parity harness.",
+                self.model_path.display()
+            );
+        }
+    }
+
+    struct DenseParityReference {
+        prompt_ids: Vec<u32>,
+        prefill_logits: Vec<f32>,
+        teacher_forced_tokens: Vec<u32>,
+        decode_logits_by_step: Vec<Vec<f32>>,
+    }
+
+    fn runtime_prefill_ctx(input_ids: Vec<u32>) -> RuntimeRequestContext {
+        RuntimeRequestContext {
+            input_ids,
+            start_pos: 0,
+            multimodal_inputs: MultimodalInputs::default(),
+        }
+    }
+
+    fn runtime_decode_ctx(input_id: u32, start_pos: usize) -> RuntimeStepContext {
+        RuntimeStepContext {
+            input_ids: vec![input_id],
+            start_pos,
+        }
+    }
+
+    fn encoded_prompt_ids(model: &dyn RuntimeModel, prompt: &str) -> Vec<u32> {
+        model
+            .tokenizer()
+            .encode(prompt, false)
+            .expect("encode prompt")
+            .get_ids()
+            .to_vec()
+    }
+
+    fn assert_top_k_match(lhs: &[f32], rhs: &[f32], k: usize) {
+        assert_eq!(top_k_indices(lhs, k), top_k_indices(rhs, k));
+    }
+
+    fn parity_harness_device() -> Device {
+        crane_core::utils::select_device(false).expect("select parity harness device")
+    }
+
+    fn parity_harness_dtype(device: &Device) -> DType {
+        match device {
+            Device::Cpu => DType::F32,
+            _ => DType::BF16,
+        }
+    }
+
+    fn collect_dense_parity_reference(
+        config: &RealCheckpointHarnessConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> DenseParityReference {
+        let mut dense = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense parity adapter");
+        let prompt_ids = encoded_prompt_ids(&dense, &config.prompt_text);
+        assert!(
+            !prompt_ids.is_empty(),
+            "real checkpoint parity prompt must tokenize to at least one token"
+        );
+        let prefill = dense
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("dense parity prefill");
+        let prefill_logits = tensor_to_vec_f32(&prefill.logits);
+
+        let mut previous_logits = prefill_logits.clone();
+        let mut teacher_forced_tokens = Vec::with_capacity(config.decode_steps);
+        let mut decode_logits_by_step = Vec::with_capacity(config.decode_steps);
+        for step in 0..config.decode_steps {
+            let token = argmax(&previous_logits) as u32;
+            teacher_forced_tokens.push(token);
+            let decode = dense
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("dense parity decode");
+            let decode_logits = tensor_to_vec_f32(&decode.logits);
+            previous_logits = decode_logits.clone();
+            decode_logits_by_step.push(decode_logits);
+        }
+
+        DenseParityReference {
+            prompt_ids,
+            prefill_logits,
+            teacher_forced_tokens,
+            decode_logits_by_step,
+        }
+    }
+
     #[test]
     fn turboquant_decode_prefix_scores_match_dense_prefix_with_bounded_drift() {
         let (prefix, key_rows, value_rows) = turboquant_prefix_fixture();
@@ -663,14 +1045,19 @@ mod tests {
             .value_prefix(0, &Device::Cpu, DType::F32)
             .expect("prefix values")
             .expect("dense fallback V");
-        assert_eq!(
-            prefix_values
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap(),
-            value_rows.concat()
-        );
+        let restored = prefix_values
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let expected = value_rows.concat();
+        assert_eq!(restored.len(), expected.len());
+        for (idx, (actual, expected)) in restored.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 0.01,
+                "idx={idx} actual={actual} expected={expected}"
+            );
+        }
     }
 
     #[test]
@@ -693,19 +1080,19 @@ mod tests {
     }
 
     #[test]
-    fn turboquant_decode_prefix_value_import_stays_dense_for_supported_layers() {
+    fn turboquant_decode_prefix_value_payload_is_backend_owned_and_restores_for_fallback() {
         let (prefix, ..) = turboquant_prefix_fixture();
         let stored = prefix.caches[0].as_ref().expect("stored cache");
 
         let KvLayerPayload::TurboQuant { value, .. } = &stored.payload else {
             panic!("expected turboquant payload")
         };
-        assert!(matches!(value, TurboQuantValuePayload::Dense(_)));
+        assert!(matches!(value, TurboQuantValuePayload::RowwiseInt8 { .. }));
 
         let imported = prefix
             .value_prefix(0, &Device::Cpu, DType::BF16)
             .expect("value prefix")
-            .expect("dense value prefix");
+            .expect("decoded value prefix");
         assert_eq!(imported.dtype(), DType::BF16);
         assert_eq!(imported.dims4().expect("value dims"), (1, 1, 2, 8));
     }
@@ -849,9 +1236,13 @@ mod tests {
             enabled_layers: vec![true; layer_count],
         });
         let score_calls_by_layer = Arc::new(Mutex::new(vec![0_usize; layer_count]));
+        let weighted_value_calls_by_layer = Arc::new(Mutex::new(vec![0_usize; layer_count]));
+        let dense_value_calls_by_layer = Arc::new(Mutex::new(vec![0_usize; layer_count]));
         let prefix = Arc::new(CountingDecodePrefixKvSource {
             inner: inner_prefix,
             score_calls_by_layer: score_calls_by_layer.clone(),
+            weighted_value_calls_by_layer: weighted_value_calls_by_layer.clone(),
+            dense_value_calls_by_layer: dense_value_calls_by_layer.clone(),
         });
 
         let mut turbo_model = tiny_decode_logit_model(layer_count);
@@ -892,5 +1283,312 @@ mod tests {
                 .expect("score calls mutex poisoned"),
             vec![1, 1, 1]
         );
+        assert_eq!(
+            *weighted_value_calls_by_layer
+                .lock()
+                .expect("weighted value calls mutex poisoned"),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            *dense_value_calls_by_layer
+                .lock()
+                .expect("dense value calls mutex poisoned"),
+            vec![0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn turboquant_runtime_checkpoint_fixture_matches_dense_baseline_on_prefill_and_restore() {
+        let fixture = RuntimeCheckpointFixture::new(3);
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        assert_eq!(prompt_ids, vec![1, 2]);
+
+        let dense_prefill = dense
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("dense prefill");
+        let turbo_prefill_logits = turbo_prefill
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("turbo prefill")
+            .logits;
+        let dense_prefill_logits = tensor_to_vec_f32(&dense_prefill.logits);
+        let turbo_prefill_logits = tensor_to_vec_f32(&turbo_prefill_logits);
+
+        assert_eq!(argmax(&dense_prefill_logits), argmax(&turbo_prefill_logits));
+        assert_top_k_match(&dense_prefill_logits, &turbo_prefill_logits, 3);
+        assert!(
+            max_abs_diff(&dense_prefill_logits, &turbo_prefill_logits) <= 1e-5,
+            "dense={dense_prefill_logits:?} turbo={turbo_prefill_logits:?}"
+        );
+
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+        assert_eq!(turbo_caches.len(), 3);
+        assert!(turbo_caches.iter().all(|stored| {
+            matches!(
+                stored.as_ref().map(|layer| &layer.payload),
+                Some(KvLayerPayload::TurboQuant { .. })
+            )
+        }));
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let first_token = argmax(&dense_prefill_logits) as u32;
+        let dense_decode = dense
+            .decode(runtime_decode_ctx(first_token, prompt_ids.len()))
+            .expect("dense decode after restore checkpoint");
+        let turbo_decode = restored_turbo
+            .decode(runtime_decode_ctx(first_token, prompt_ids.len()))
+            .expect("turbo decode after restore checkpoint");
+        let dense_decode_logits = tensor_to_vec_f32(&dense_decode.logits);
+        let turbo_decode_logits = tensor_to_vec_f32(&turbo_decode.logits);
+
+        assert_eq!(argmax(&dense_decode_logits), argmax(&turbo_decode_logits));
+        assert_top_k_match(&dense_decode_logits, &turbo_decode_logits, 3);
+        assert!(
+            max_abs_diff(&dense_decode_logits, &turbo_decode_logits) <= 0.35,
+            "dense={dense_decode_logits:?} turbo={turbo_decode_logits:?}"
+        );
+    }
+
+    #[test]
+    fn turboquant_runtime_checkpoint_fixture_keeps_teacher_forced_multi_step_stream_stable() {
+        let fixture = RuntimeCheckpointFixture::new(3);
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        let dense_prefill = dense
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("dense prefill");
+        turbo_prefill
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("turbo prefill");
+
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let teacher_forced_stream = [2_u32, 2, 1, 2];
+        let mut dense_next_tokens = vec![argmax(&tensor_to_vec_f32(&dense_prefill.logits)) as u32];
+        let mut turbo_next_tokens = Vec::new();
+
+        for (step, token) in teacher_forced_stream.into_iter().enumerate() {
+            let turbo_step = restored_turbo
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("turbo multi-step decode");
+            let dense_step = dense
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("dense multi-step decode");
+
+            let turbo_logits = tensor_to_vec_f32(&turbo_step.logits);
+            let dense_logits = tensor_to_vec_f32(&dense_step.logits);
+            let dense_argmax = argmax(&dense_logits) as u32;
+            let turbo_argmax = argmax(&turbo_logits) as u32;
+            dense_next_tokens.push(dense_argmax);
+            turbo_next_tokens.push(turbo_argmax);
+
+            assert_eq!(
+                dense_argmax, turbo_argmax,
+                "step={step} dense={dense_logits:?} turbo={turbo_logits:?}"
+            );
+            assert_top_k_match(&dense_logits, &turbo_logits, 3);
+            assert!(
+                max_abs_diff(&dense_logits, &turbo_logits) <= 0.45,
+                "step={step} dense={dense_logits:?} turbo={turbo_logits:?}"
+            );
+        }
+
+        assert_eq!(dense_next_tokens[1..], turbo_next_tokens);
+    }
+
+    #[test]
+    fn tiny_runtime_checkpoint_fixture_loads_through_model_new() {
+        let fixture = RuntimeCheckpointFixture::new(3);
+        let model = Gemma4Model::new(fixture.path_str(), &Device::Cpu, &DType::F32)
+            .expect("load tiny runtime checkpoint through Model::new");
+        let prompt_ids = model
+            .tokenizer
+            .tokenizer
+            .encode(fixture.prompt_text, false)
+            .expect("encode prompt from on-disk tokenizer")
+            .get_ids()
+            .to_vec();
+        assert_eq!(prompt_ids, vec![1, 2]);
+        assert_eq!(model.num_layers(), 3);
+    }
+
+    #[test]
+    #[ignore = "manual integration: requires GPU-accessible real Gemma4 checkpoint mount"]
+    fn gemma4_real_checkpoint_turboquant_restore_parity_harness() {
+        let config = RealCheckpointHarnessConfig::from_env();
+        config.require_accessible_path();
+
+        let device = parity_harness_device();
+        let dtype = parity_harness_dtype(&device);
+        let dense_reference = collect_dense_parity_reference(&config, &device, dtype);
+
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            &device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo parity adapter");
+        let turbo_prefill_logits = tensor_to_vec_f32(
+            &turbo_prefill
+                .prefill(runtime_prefill_ctx(dense_reference.prompt_ids.clone()))
+                .expect("turbo parity prefill")
+                .logits,
+        );
+
+        let prefill_dense_top1 = argmax(&dense_reference.prefill_logits) as u32;
+        let prefill_turbo_top1 = argmax(&turbo_prefill_logits) as u32;
+        eprintln!(
+            "[gemma4-real-parity] device={device:?} dtype={dtype:?} path={} prompt_tokens={} decode_steps={} prefill_top1_dense={} prefill_top1_turbo={} prefill_max_abs_diff={:.6}",
+            config.model_path.display(),
+            dense_reference.prompt_ids.len(),
+            config.decode_steps,
+            prefill_dense_top1,
+            prefill_turbo_top1,
+            max_abs_diff(&dense_reference.prefill_logits, &turbo_prefill_logits),
+        );
+        assert_eq!(
+            prefill_dense_top1, prefill_turbo_top1,
+            "prefill top-1 drifted before restore path"
+        );
+
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+        assert_eq!(turbo_caches.len(), turbo_prefill.num_layers());
+        assert!(turbo_caches.iter().all(|stored| {
+            matches!(
+                stored.as_ref().map(|layer| &layer.payload),
+                Some(KvLayerPayload::TurboQuant { .. })
+            )
+        }));
+        drop(turbo_prefill);
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            &device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo parity adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let expected_enabled_layers: Vec<bool> = (0..restored_turbo.num_layers())
+            .map(|layer_idx| {
+                !restored_turbo.model.has_shared_kv_layers()
+                    && !restored_turbo.model.layer_uses_sliding_window(layer_idx)
+            })
+            .collect();
+        let actual_enabled_layers = restored_turbo
+            .decode_prefix
+            .as_ref()
+            .map(|prefix| prefix.enabled_layers.clone())
+            .unwrap_or_else(|| vec![false; restored_turbo.num_layers()]);
+        assert_eq!(actual_enabled_layers, expected_enabled_layers);
+        eprintln!(
+            "[gemma4-real-parity] decode_prefix_enabled_layers={}/{} shared_kv={} sliding_layers={}",
+            actual_enabled_layers.iter().filter(|enabled| **enabled).count(),
+            actual_enabled_layers.len(),
+            restored_turbo.model.has_shared_kv_layers(),
+            (0..restored_turbo.num_layers())
+                .filter(|layer_idx| restored_turbo.model.layer_uses_sliding_window(*layer_idx))
+                .count(),
+        );
+
+        for (step, token) in dense_reference
+            .teacher_forced_tokens
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let turbo_step = restored_turbo
+                .decode(runtime_decode_ctx(
+                    token,
+                    dense_reference.prompt_ids.len() + step,
+                ))
+                .expect("turbo parity decode");
+            let turbo_logits = tensor_to_vec_f32(&turbo_step.logits);
+            let dense_logits = &dense_reference.decode_logits_by_step[step];
+            let dense_top1 = argmax(dense_logits) as u32;
+            let turbo_top1 = argmax(&turbo_logits) as u32;
+            let dense_top5 = top_k_indices(dense_logits, 5);
+            let turbo_top5 = top_k_indices(&turbo_logits, 5);
+            let drift = max_abs_diff(dense_logits, &turbo_logits);
+            eprintln!(
+                "[gemma4-real-parity] step={step} input_token={token} dense_top1={dense_top1} turbo_top1={turbo_top1} max_abs_diff={drift:.6} dense_top5={dense_top5:?} turbo_top5={turbo_top5:?}"
+            );
+            assert_eq!(
+                dense_top1, turbo_top1,
+                "real checkpoint turboquant top-1 drift at decode step {step}"
+            );
+            assert!(
+                drift.is_finite(),
+                "real checkpoint turboquant drift must stay finite at decode step {step}"
+            );
+        }
     }
 }

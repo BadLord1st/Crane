@@ -103,6 +103,11 @@ pub struct TurboQuantKeyPayload {
 #[derive(Debug, Clone)]
 pub enum TurboQuantValuePayload {
     Dense(Tensor),
+    RowwiseInt8 {
+        row_width: usize,
+        scales: Vec<f32>,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +169,18 @@ pub trait KvCacheBackend: Send + Sync + 'static {
         &self,
         _query: &Tensor,
         _stored: &KvLayerEnvelope,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    fn weighted_value_prefix(
+        &self,
+        _attn_weights: &Tensor,
+        _stored: &KvLayerEnvelope,
+        _num_kv_heads: usize,
+        _num_kv_groups: usize,
+        _target_device: &Device,
+        _target_dtype: DType,
     ) -> Result<Option<Tensor>> {
         Ok(None)
     }
@@ -637,6 +654,123 @@ impl TurboQuantBackend {
         })
     }
 
+    fn encode_value_payload(
+        &self,
+        value: &Tensor,
+        value_shape: &[usize],
+    ) -> Result<TurboQuantValuePayload> {
+        let row_width = *value_shape
+            .last()
+            .ok_or_else(|| anyhow!("turboquant value tensor must have rank >= 1"))?;
+        let value_values = Int8RowwiseKvBackend::flatten_to_f32(value)?;
+        let (scales, quants) = Int8RowwiseKvBackend::quantize_rowwise(&value_values, row_width)?;
+        Ok(TurboQuantValuePayload::RowwiseInt8 {
+            row_width,
+            scales,
+            bytes: quants.into_iter().map(|value| value as u8).collect(),
+        })
+    }
+
+    fn decode_value_payload(
+        value: &TurboQuantValuePayload,
+        value_shape: &[usize],
+    ) -> Result<Vec<f32>> {
+        let values = match value {
+            TurboQuantValuePayload::Dense(value) => Int8RowwiseKvBackend::flatten_to_f32(value),
+            TurboQuantValuePayload::RowwiseInt8 {
+                row_width,
+                scales,
+                bytes,
+            } => Int8RowwiseKvBackend::dequantize_rowwise(scales, *row_width, bytes),
+        }?;
+
+        let expected_len = value_shape.iter().product::<usize>();
+        if values.len() != expected_len {
+            bail!(
+                "turboquant value payload length mismatch: got {} values, expected {}",
+                values.len(),
+                expected_len
+            );
+        }
+        Ok(values)
+    }
+
+    fn weighted_value_from_rowwise_payload(
+        &self,
+        attn_weights: &Tensor,
+        value_shape: &[usize],
+        value: &TurboQuantValuePayload,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        let TurboQuantValuePayload::RowwiseInt8 {
+            row_width,
+            scales,
+            bytes,
+        } = value
+        else {
+            return Ok(None);
+        };
+
+        if value_shape.len() != 4 || value_shape[0] != 1 {
+            return Ok(None);
+        }
+
+        let prefix_len = value_shape[2];
+        let stored_kv_heads = value_shape[1];
+        if stored_kv_heads != num_kv_heads || value_shape[3] != *row_width {
+            return Ok(None);
+        }
+
+        let (batch, num_heads, q_len, weight_prefix_len) = attn_weights.dims4()?;
+        if batch != 1
+            || q_len != 1
+            || num_heads != num_kv_heads * num_kv_groups
+            || weight_prefix_len != prefix_len
+        {
+            return Ok(None);
+        }
+
+        let expected_rows = stored_kv_heads * prefix_len;
+        if scales.len() != expected_rows || bytes.len() != expected_rows * row_width {
+            bail!("turboquant rowwise V payload metadata mismatch");
+        }
+
+        let weights = attn_weights
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .reshape((num_heads, prefix_len))?
+            .to_vec2::<f32>()?;
+        let mut aggregated = vec![0.0_f32; num_heads * row_width];
+        for head_idx in 0..num_heads {
+            let kv_head_idx = head_idx / num_kv_groups;
+            let out_row = &mut aggregated[head_idx * row_width..(head_idx + 1) * row_width];
+            for pos_idx in 0..prefix_len {
+                let weight = weights[head_idx][pos_idx];
+                if weight == 0.0 {
+                    continue;
+                }
+                let row_idx = kv_head_idx * prefix_len + pos_idx;
+                let scale = scales[row_idx];
+                if scale == 0.0 {
+                    continue;
+                }
+                let row_bytes = &bytes[row_idx * row_width..(row_idx + 1) * row_width];
+                for (dst, quantized) in out_row.iter_mut().zip(row_bytes.iter()) {
+                    *dst += weight * ((*quantized as i8) as f32 * scale);
+                }
+            }
+        }
+
+        Ok(Some(
+            Tensor::from_vec(aggregated, (1, num_heads, 1, *row_width), &Device::Cpu)?
+                .to_device(target_device)?
+                .to_dtype(target_dtype)?,
+        ))
+    }
+
     fn query_rows(query: &Tensor, row_width: usize) -> Result<Vec<Vec<f32>>> {
         let query = query.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let shape = query.shape().dims();
@@ -785,6 +919,10 @@ impl KvCacheBackend for Bf16PassthroughBackend {
                 let value_dense_bytes = match value {
                     TurboQuantValuePayload::Dense(value) => {
                         value.elem_count() as u64 * value.dtype().size_in_bytes() as u64
+                    }
+                    TurboQuantValuePayload::RowwiseInt8 { scales, bytes, .. } => {
+                        (scales.len() as u64 * std::mem::size_of::<f32>() as u64)
+                            + bytes.len() as u64
                     }
                 };
                 key_dense_bytes
@@ -982,6 +1120,10 @@ impl KvCacheBackend for Int8RowwiseKvBackend {
                     TurboQuantValuePayload::Dense(value) => {
                         value.elem_count() as u64 * value.dtype().size_in_bytes() as u64
                     }
+                    TurboQuantValuePayload::RowwiseInt8 { scales, bytes, .. } => {
+                        (scales.len() as u64 * std::mem::size_of::<f32>() as u64)
+                            + bytes.len() as u64
+                    }
                 };
                 key_dense_bytes
                     + value_dense_bytes
@@ -1124,11 +1266,11 @@ impl KvCacheBackend for TurboQuantBackend {
             layer_idx,
             seq_len,
             key_shape: key_shape.clone(),
-            value_shape,
+            value_shape: value_shape.clone(),
             dtype,
             payload: KvLayerPayload::TurboQuant {
                 key: self.encode_key_payload(&key, &key_shape)?,
-                value: TurboQuantValuePayload::Dense(value),
+                value: self.encode_value_payload(&value, &value_shape)?,
             },
         }))
     }
@@ -1151,11 +1293,13 @@ impl KvCacheBackend for TurboQuantBackend {
                     .dense_fallback
                     .to_device(target_device)?
                     .to_dtype(target_dtype)?;
-                let value = match value {
-                    TurboQuantValuePayload::Dense(value) => {
-                        value.to_device(target_device)?.to_dtype(target_dtype)?
-                    }
-                };
+                let value = Tensor::from_vec(
+                    Self::decode_value_payload(&value, &stored.value_shape)?,
+                    stored.value_shape.as_slice(),
+                    &Device::Cpu,
+                )?
+                .to_device(target_device)?
+                .to_dtype(target_dtype)?;
                 Ok(Some((key, value)))
             }
             _ => bail!(
@@ -1176,6 +1320,10 @@ impl KvCacheBackend for TurboQuantBackend {
                 let value_dense_bytes = match value {
                     TurboQuantValuePayload::Dense(value) => {
                         value.elem_count() as u64 * value.dtype().size_in_bytes() as u64
+                    }
+                    TurboQuantValuePayload::RowwiseInt8 { scales, bytes, .. } => {
+                        (scales.len() as u64 * std::mem::size_of::<f32>() as u64)
+                            + bytes.len() as u64
                     }
                 };
                 key_dense_bytes
@@ -1295,6 +1443,35 @@ impl KvCacheBackend for TurboQuantBackend {
                             );
                         }
                     }
+                    TurboQuantValuePayload::RowwiseInt8 {
+                        row_width,
+                        scales,
+                        bytes,
+                    } => {
+                        let expected_row_width = *stored.value_shape.last().unwrap_or(&0);
+                        if *row_width != expected_row_width {
+                            bail!(
+                                "turboquant V row width mismatch for layer {}: stored={} expected={}",
+                                layer_idx,
+                                row_width,
+                                expected_row_width
+                            );
+                        }
+                        let expected_rows = stored.value_shape[..stored.value_shape.len() - 1]
+                            .iter()
+                            .product::<usize>();
+                        if scales.len() != expected_rows {
+                            bail!(
+                                "turboquant V scale count mismatch for layer {}: stored={} expected={}",
+                                layer_idx,
+                                scales.len(),
+                                expected_rows
+                            );
+                        }
+                        if bytes.len() != stored.value_shape.iter().product::<usize>() {
+                            bail!("turboquant V byte length mismatch for layer {}", layer_idx);
+                        }
+                    }
                 }
             }
             _ => bail!(
@@ -1332,6 +1509,33 @@ impl KvCacheBackend for TurboQuantBackend {
             &Device::Cpu,
         )?))
     }
+
+    fn weighted_value_prefix(
+        &self,
+        attn_weights: &Tensor,
+        stored: &KvLayerEnvelope,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        self.validate_layer(stored.layer_idx, stored)?;
+        let KvLayerPayload::TurboQuant { value, .. } = &stored.payload else {
+            bail!(
+                "KV backend '{}' expected turboquant payloads",
+                self.backend_id()
+            );
+        };
+        self.weighted_value_from_rowwise_payload(
+            attn_weights,
+            &stored.value_shape,
+            value,
+            num_kv_heads,
+            num_kv_groups,
+            target_device,
+            target_dtype,
+        )
+    }
 }
 
 pub fn make_kv_backend(config: KvBackendConfig) -> Result<Box<dyn KvCacheBackend>> {
@@ -1350,12 +1554,10 @@ pub fn move_kv_caches_to_device(caches: &mut LayerKvCaches, target_device: &Devi
         };
         let (key, value) = match &mut stored.payload {
             KvLayerPayload::Dense { key, value } => (key, value),
-            KvLayerPayload::TurboQuant { key, value } => {
-                let value = match value {
-                    TurboQuantValuePayload::Dense(value) => value,
-                };
-                (&mut key.dense_fallback, value)
-            }
+            KvLayerPayload::TurboQuant { key, value } => match value {
+                TurboQuantValuePayload::Dense(value) => (&mut key.dense_fallback, value),
+                TurboQuantValuePayload::RowwiseInt8 { .. } => continue,
+            },
             KvLayerPayload::Encoded { .. } => continue,
         };
         let already_on_target = matches!((key.device(), target_device), (Device::Cpu, Device::Cpu))
@@ -1411,6 +1613,7 @@ pub fn stored_kv_cache_bytes(caches: &[Option<KvLayerEnvelope>]) -> u64 {
                             value.elem_count() as u64 * value.dtype().size_in_bytes() as u64
                         }
                     }
+                    TurboQuantValuePayload::RowwiseInt8 { .. } => 0,
                 };
                 key_bytes + value_bytes
             }
@@ -1538,8 +1741,54 @@ mod tests {
         assert_eq!(key.sign_bits.len(), 2);
         assert_eq!(key.residual_sketch.len(), 8);
         assert_eq!(key.dense_fallback.shape().dims(), &[1, 1, 2, 8]);
-        assert!(matches!(value, TurboQuantValuePayload::Dense(_)));
+        assert!(matches!(value, TurboQuantValuePayload::RowwiseInt8 { .. }));
         assert_ne!(key.sign_bits.len(), key.dense_fallback.elem_count());
+    }
+
+    #[test]
+    fn turboquant_weighted_value_prefix_consumes_backend_owned_v_path() {
+        let backend = TurboQuantBackend;
+        let key = Tensor::zeros((1, 1, 2, 8), DType::F32, &Device::Cpu).unwrap();
+        let value_rows = vec![
+            vec![0.1_f32, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, -0.4],
+            vec![0.5_f32, 0.6, 0.7, 0.8, -0.5, -0.6, -0.7, -0.8],
+        ];
+        let value = Tensor::from_vec(value_rows.concat(), (1, 1, 2, 8), &Device::Cpu).unwrap();
+        let stored = backend
+            .export_layer(0, Some((key, value)))
+            .unwrap()
+            .unwrap();
+
+        let attn_weights =
+            Tensor::from_vec(vec![0.75_f32, 0.25, 0.10, 0.90], (1, 2, 1, 2), &Device::Cpu).unwrap();
+        let aggregated = backend
+            .weighted_value_prefix(&attn_weights, &stored, 1, 2, &Device::Cpu, DType::F32)
+            .unwrap()
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+
+        let expected = vec![
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.75 * lhs + 0.25 * rhs)
+                .collect::<Vec<_>>(),
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.10 * lhs + 0.90 * rhs)
+                .collect::<Vec<_>>(),
+        ];
+
+        for (actual_row, expected_row) in aggregated.iter().zip(expected.iter()) {
+            for (actual, expected) in actual_row[0].iter().zip(expected_row.iter()) {
+                assert!(
+                    (*actual - *expected).abs() <= 0.02_f32,
+                    "actual={actual} expected={expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1581,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn turboquant_import_restores_dense_fallback_for_safe_decode() {
+    fn turboquant_import_restores_dense_key_fallback_and_decoded_v_for_safe_decode() {
         let backend = TurboQuantBackend;
         let key_values = vec![
             -0.78_f32, -0.82, 0.75, 0.79, 0.11, -0.08, 0.09, -0.12, 0.84, 0.81, -0.77, -0.74,
@@ -1604,10 +1853,20 @@ mod tests {
             restored.0.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             key_values
         );
-        assert_eq!(
-            restored.1.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            value_values
-        );
+        for (actual, expected) in restored
+            .1
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .zip(value_values.iter())
+        {
+            assert!(
+                (actual - expected).abs() <= 0.02,
+                "actual={actual} expected={expected}"
+            );
+        }
     }
 
     #[test]

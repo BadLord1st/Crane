@@ -355,7 +355,7 @@ async fn main() -> Result<()> {
         if let Some(suggested_max_seq_len) = model_spec.limits.suggested_max_seq_len {
             info!(
                 suggested_max_seq_len,
-                "No explicit max_seq_len configured; consider setting --max-seq-len or CRANE_TEXT_PREFILL_TOKEN_LIMIT for long text-prefill protection"
+                "No explicit max_seq_len configured; long text-prefill admission will use the dynamic budget policy (and optional CRANE_TEXT_PREFILL_TOKEN_LIMIT hard cap)"
             );
         }
     }
@@ -711,7 +711,7 @@ async fn main() -> Result<()> {
         };
         let configured_headroom = configured_limit.saturating_sub(baseline_gpu);
         info!(
-            "Memory config: max_seq_len={}, text_prefill_token_limit={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
+            "Memory config: max_seq_len={}, text_prefill_token_limit={}, text_prefill_admission_mode={}, text_prefill_admission_reserve={}, text_prefill_admission_bytes_per_token={}, text_prefill_running_penalty_tokens={}, text_prefill_waiting_penalty_tokens={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
             if memory_config.max_seq_len == 0 {
                 "unlimited".to_string()
             } else {
@@ -721,6 +721,11 @@ async fn main() -> Result<()> {
                 .text_prefill_token_limit
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "disabled".to_string()),
+            memory_config.text_prefill_admission.mode.as_str(),
+            format_bytes(memory_config.text_prefill_admission.reserve_bytes),
+            memory_config.text_prefill_admission.bytes_per_token,
+            memory_config.text_prefill_admission.running_penalty_tokens,
+            memory_config.text_prefill_admission.waiting_penalty_tokens,
             if memory_config.gpu_memory_limit_bytes == 0 {
                 "unlimited".to_string()
             } else {
@@ -746,10 +751,18 @@ async fn main() -> Result<()> {
                 format_bytes(configured_headroom)
             },
         );
-        if memory_config.text_prefill_token_limit.is_some() {
+        if memory_config.text_prefill_token_limit.is_some()
+            || memory_config.text_prefill_admission.mode
+                != engine::TextPrefillAdmissionMode::Off
+        {
             info!(
                 text_prefill_token_limit = ?memory_config.text_prefill_token_limit,
-                "Text-only prefill guardrail enabled"
+                text_prefill_admission_mode = memory_config.text_prefill_admission.mode.as_str(),
+                text_prefill_admission_reserve = %format_bytes(memory_config.text_prefill_admission.reserve_bytes),
+                text_prefill_admission_bytes_per_token = memory_config.text_prefill_admission.bytes_per_token,
+                text_prefill_running_penalty_tokens = memory_config.text_prefill_admission.running_penalty_tokens,
+                text_prefill_waiting_penalty_tokens = memory_config.text_prefill_admission.waiting_penalty_tokens,
+                "Text-only prefill admission configured"
             );
         }
 
@@ -900,13 +913,14 @@ async fn main() -> Result<()> {
     println!("  {sep}\n");
 
     info!(
-        "Startup complete (total_startup_ms={}, model_type={}, device={}, dtype={}, kv_cache_mode={}, text_prefill_token_limit={})",
+        "Startup complete (total_startup_ms={}, model_type={}, device={}, dtype={}, kv_cache_mode={}, text_prefill_token_limit={}, text_prefill_admission_mode={})",
         startup_t0.elapsed().as_millis(),
         resolved_type.display_name(),
         state.device_name,
         state.dtype_name,
         kv_backend_config.mode,
         std::env::var("CRANE_TEXT_PREFILL_TOKEN_LIMIT").unwrap_or_else(|_| "disabled".to_string()),
+        std::env::var("CRANE_TEXT_PREFILL_ADMISSION_MODE").unwrap_or_else(|_| "dynamic".to_string()),
     );
 
     axum::serve(listener, app).await?;

@@ -69,6 +69,8 @@ pub struct MemoryConfig {
     /// Optional guardrail for text-only prompt prefill when max_seq_len is unlimited.
     /// Parsed from `CRANE_TEXT_PREFILL_TOKEN_LIMIT`. `None` = disabled.
     pub text_prefill_token_limit: Option<usize>,
+    /// Dynamic text-only prefill admission settings used when max_seq_len is unlimited.
+    pub text_prefill_admission: TextPrefillAdmissionConfig,
     /// GPU memory limit in bytes. 0 = unlimited.
     /// This is an **absolute** limit on total GPU memory usage.
     pub gpu_memory_limit_bytes: u64,
@@ -93,9 +95,11 @@ impl MemoryConfig {
         let text_prefill_token_limit = Self::parse_text_prefill_token_limit_env(
             std::env::var("CRANE_TEXT_PREFILL_TOKEN_LIMIT").ok(),
         );
+        let text_prefill_admission = TextPrefillAdmissionConfig::parse_from_env(device);
         Self {
             max_seq_len,
             text_prefill_token_limit,
+            text_prefill_admission,
             gpu_memory_limit_bytes,
             baseline_gpu_bytes: 0,
         }
@@ -182,16 +186,256 @@ impl MemoryConfig {
     }
 }
 
-fn should_reject_text_prefill_request(
-    memory_config: &MemoryConfig,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPrefillAdmissionMode {
+    Off,
+    Dynamic,
+}
+
+impl TextPrefillAdmissionMode {
+    fn parse_env(raw: Option<String>) -> Self {
+        match raw.as_deref().map(str::trim) {
+            None | Some("") | Some("dynamic") | Some("estimate") | Some("on") | Some("1") => {
+                Self::Dynamic
+            }
+            Some("off") | Some("disabled") | Some("0") => Self::Off,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "Could not parse CRANE_TEXT_PREFILL_ADMISSION_MODE, defaulting to dynamic"
+                );
+                Self::Dynamic
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextPrefillAdmissionConfig {
+    pub mode: TextPrefillAdmissionMode,
+    pub reserve_bytes: u64,
+    pub bytes_per_token: u64,
+    pub running_penalty_tokens: usize,
+    pub waiting_penalty_tokens: usize,
+}
+
+impl TextPrefillAdmissionConfig {
+    const DEFAULT_RESERVE_BYTES: u64 = 2 * (1u64 << 30);
+    const DEFAULT_BYTES_PER_TOKEN: u64 = 2 * (1u64 << 20);
+    const DEFAULT_RUNNING_PENALTY_TOKENS: usize = 256;
+    const DEFAULT_WAITING_PENALTY_TOKENS: usize = 128;
+
+    fn parse_from_env(device: &Device) -> Self {
+        Self {
+            mode: TextPrefillAdmissionMode::parse_env(
+                std::env::var("CRANE_TEXT_PREFILL_ADMISSION_MODE").ok(),
+            ),
+            reserve_bytes: Self::parse_u64_env(
+                "CRANE_TEXT_PREFILL_ADMISSION_RESERVE_BYTES",
+                Self::DEFAULT_RESERVE_BYTES,
+            ),
+            bytes_per_token: Self::parse_u64_env(
+                "CRANE_TEXT_PREFILL_ADMISSION_BYTES_PER_TOKEN",
+                Self::DEFAULT_BYTES_PER_TOKEN,
+            )
+            .max(1),
+            running_penalty_tokens: Self::parse_usize_env(
+                "CRANE_TEXT_PREFILL_ADMISSION_RUNNING_PENALTY_TOKENS",
+                Self::DEFAULT_RUNNING_PENALTY_TOKENS,
+            ),
+            waiting_penalty_tokens: Self::parse_usize_env(
+                "CRANE_TEXT_PREFILL_ADMISSION_WAITING_PENALTY_TOKENS",
+                Self::DEFAULT_WAITING_PENALTY_TOKENS,
+            ),
+        }
+        .with_fractional_reserve_if_requested(device)
+    }
+
+    fn with_fractional_reserve_if_requested(mut self, device: &Device) -> Self {
+        let Some(raw) = std::env::var("CRANE_TEXT_PREFILL_ADMISSION_RESERVE").ok() else {
+            return self;
+        };
+
+        let parsed = MemoryConfig::parse_memory_limit(&raw, device);
+        if parsed == 0 && raw.trim() != "0" {
+            tracing::warn!(
+                value = raw,
+                "Could not parse CRANE_TEXT_PREFILL_ADMISSION_RESERVE, keeping reserve_bytes"
+            );
+            return self;
+        }
+        self.reserve_bytes = parsed;
+        self
+    }
+
+    fn parse_u64_env(name: &str, default: u64) -> u64 {
+        match std::env::var(name) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        value = raw,
+                        variable = name,
+                        "Could not parse env as u64, using default"
+                    );
+                    default
+                }
+            },
+            Err(_) => default,
+        }
+    }
+
+    fn parse_usize_env(name: &str, default: usize) -> usize {
+        match std::env::var(name) {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        value = raw,
+                        variable = name,
+                        "Could not parse env as usize, using default"
+                    );
+                    default
+                }
+            },
+            Err(_) => default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextPrefillAdmissionSnapshot {
     prompt_len: usize,
-    multimodal_inputs: &types::MultimodalInputs,
-) -> Option<usize> {
-    let limit = memory_config.text_prefill_token_limit?;
-    if memory_config.max_seq_len != 0 || !multimodal_inputs.is_empty() || prompt_len <= limit {
+    gpu_used_bytes: u64,
+    gpu_total_bytes: u64,
+    tracked_kv_bytes: u64,
+    running_sequences: usize,
+    waiting_sequences: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextPrefillAdmissionEstimate {
+    allowed_prompt_len_now: usize,
+    configured_limit_bytes: u64,
+    headroom_budget_bytes: u64,
+    accounted_growth_bytes: u64,
+    available_growth_bytes: u64,
+    reserve_bytes: u64,
+    tracked_growth_bytes: u64,
+    running_penalty_tokens: usize,
+    waiting_penalty_tokens: usize,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextPrefillAdmissionRejection {
+    HardCap {
+        limit: usize,
+    },
+    Dynamic {
+        estimate: TextPrefillAdmissionEstimate,
+    },
+}
+
+fn estimate_text_prefill_allowed_prompt_len(
+    memory_config: &MemoryConfig,
+    snapshot: &TextPrefillAdmissionSnapshot,
+) -> Option<TextPrefillAdmissionEstimate> {
+    if memory_config.max_seq_len != 0
+        || memory_config.text_prefill_admission.mode != TextPrefillAdmissionMode::Dynamic
+    {
         return None;
     }
-    Some(limit)
+
+    let configured_limit_bytes = if memory_config.gpu_memory_limit_bytes > 0 {
+        memory_config.gpu_memory_limit_bytes
+    } else if snapshot.gpu_total_bytes > 0 {
+        snapshot.gpu_total_bytes
+    } else {
+        return None;
+    };
+
+    let headroom_budget_bytes =
+        configured_limit_bytes.saturating_sub(memory_config.baseline_gpu_bytes);
+    let observed_growth_bytes = snapshot
+        .gpu_used_bytes
+        .saturating_sub(memory_config.baseline_gpu_bytes);
+    let tracked_growth_bytes = snapshot
+        .tracked_kv_bytes
+        .saturating_mul(KV_GPU_OVERHEAD_FACTOR);
+    let accounted_growth_bytes = observed_growth_bytes.max(tracked_growth_bytes);
+    let reserve_bytes = memory_config
+        .text_prefill_admission
+        .reserve_bytes
+        .min(headroom_budget_bytes);
+    let available_growth_bytes = headroom_budget_bytes
+        .saturating_sub(accounted_growth_bytes)
+        .saturating_sub(reserve_bytes);
+
+    let tokens_from_bytes = (available_growth_bytes
+        / memory_config.text_prefill_admission.bytes_per_token)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let running_penalty_tokens = snapshot
+        .running_sequences
+        .saturating_mul(memory_config.text_prefill_admission.running_penalty_tokens);
+    let waiting_penalty_tokens = snapshot
+        .waiting_sequences
+        .saturating_mul(memory_config.text_prefill_admission.waiting_penalty_tokens);
+    let allowed_prompt_len_now = tokens_from_bytes
+        .saturating_sub(running_penalty_tokens)
+        .saturating_sub(waiting_penalty_tokens);
+
+    let reason = if available_growth_bytes == 0 {
+        "gpu_headroom"
+    } else if running_penalty_tokens > 0 || waiting_penalty_tokens > 0 {
+        "gpu_headroom_and_queue_load"
+    } else {
+        "gpu_headroom_budget"
+    };
+
+    Some(TextPrefillAdmissionEstimate {
+        allowed_prompt_len_now,
+        configured_limit_bytes,
+        headroom_budget_bytes,
+        accounted_growth_bytes,
+        available_growth_bytes,
+        reserve_bytes,
+        tracked_growth_bytes,
+        running_penalty_tokens,
+        waiting_penalty_tokens,
+        reason,
+    })
+}
+
+fn should_reject_text_prefill_request(
+    memory_config: &MemoryConfig,
+    snapshot: &TextPrefillAdmissionSnapshot,
+    multimodal_inputs: &types::MultimodalInputs,
+) -> Option<TextPrefillAdmissionRejection> {
+    if memory_config.max_seq_len != 0 || !multimodal_inputs.is_empty() {
+        return None;
+    }
+
+    if let Some(limit) = memory_config.text_prefill_token_limit {
+        if snapshot.prompt_len > limit {
+            return Some(TextPrefillAdmissionRejection::HardCap { limit });
+        }
+    }
+
+    let estimate = estimate_text_prefill_allowed_prompt_len(memory_config, snapshot)?;
+    if snapshot.prompt_len > estimate.allowed_prompt_len_now {
+        return Some(TextPrefillAdmissionRejection::Dynamic { estimate });
+    }
+
+    None
 }
 
 fn is_probable_oom(err: &str) -> bool {
@@ -358,7 +602,7 @@ impl InferenceEngine {
             }
         }
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, text_prefill_token_limit={})",
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, text_prefill_token_limit={}, text_prefill_admission_mode={}, text_prefill_admission_reserve={}, text_prefill_admission_bytes_per_token={}, text_prefill_running_penalty_tokens={}, text_prefill_waiting_penalty_tokens={})",
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
             if self.memory_config.max_seq_len == 0 {
@@ -370,6 +614,15 @@ impl InferenceEngine {
                 .text_prefill_token_limit
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "disabled".to_string()),
+            self.memory_config.text_prefill_admission.mode.as_str(),
+            format_bytes_engine(self.memory_config.text_prefill_admission.reserve_bytes),
+            self.memory_config.text_prefill_admission.bytes_per_token,
+            self.memory_config
+                .text_prefill_admission
+                .running_penalty_tokens,
+            self.memory_config
+                .text_prefill_admission
+                .waiting_penalty_tokens,
         );
 
         loop {
@@ -764,25 +1017,92 @@ impl InferenceEngine {
         let request_id = req.id.clone();
         let request_tokens = req.tokens.clone();
         let request_multimodal = req.multimodal_inputs.clone();
-
-        if let Some(limit) = should_reject_text_prefill_request(
-            &self.memory_config,
+        let (gpu_used_bytes, gpu_total_bytes) = query_gpu_memory_usage(self.model.device());
+        let admission_snapshot = TextPrefillAdmissionSnapshot {
             prompt_len,
-            &req.multimodal_inputs,
-        ) {
-            warn!(
+            gpu_used_bytes,
+            gpu_total_bytes,
+            tracked_kv_bytes: self.kv_manager.tracked_kv_bytes(),
+            running_sequences: self.scheduler.running.len(),
+            waiting_sequences: self.scheduler.waiting.len(),
+        };
+        let dynamic_estimate =
+            estimate_text_prefill_allowed_prompt_len(&self.memory_config, &admission_snapshot);
+
+        if let Some(estimate) = dynamic_estimate.as_ref() {
+            info!(
                 id = %req.id,
                 prompt_len,
-                text_prefill_token_limit = limit,
-                queue_waiting = self.scheduler.waiting.len(),
-                queue_running = self.scheduler.running.len(),
-                image_inputs = req.multimodal_inputs.image_urls.len(),
-                audio_inputs = req.multimodal_inputs.audio_urls.len(),
-                "Prompt exceeds text-only prefill guardrail, rejecting request",
+                allowed_prompt_len_now = estimate.allowed_prompt_len_now,
+                admission_reason = estimate.reason,
+                gpu_used = %format_bytes_engine(admission_snapshot.gpu_used_bytes),
+                gpu_total = %format_bytes_engine(admission_snapshot.gpu_total_bytes),
+                configured_limit = %format_bytes_engine(estimate.configured_limit_bytes),
+                headroom_budget = %format_bytes_engine(estimate.headroom_budget_bytes),
+                accounted_growth = %format_bytes_engine(estimate.accounted_growth_bytes),
+                available_growth = %format_bytes_engine(estimate.available_growth_bytes),
+                reserve = %format_bytes_engine(estimate.reserve_bytes),
+                tracked_kv = %format_bytes_engine(admission_snapshot.tracked_kv_bytes),
+                tracked_growth = %format_bytes_engine(estimate.tracked_growth_bytes),
+                running = admission_snapshot.running_sequences,
+                waiting = admission_snapshot.waiting_sequences,
+                running_penalty_tokens = estimate.running_penalty_tokens,
+                waiting_penalty_tokens = estimate.waiting_penalty_tokens,
+                hard_cap = ?self.memory_config.text_prefill_token_limit,
+                "Dynamic text-prefill admission evaluated",
             );
-            let _ = req.response_tx.send(EngineResponse::Error(format!(
-                "Prompt length ({prompt_len}) exceeds CRANE_TEXT_PREFILL_TOKEN_LIMIT ({limit}) for text-only requests while server max_seq_len is unlimited"
-            )));
+        }
+
+        if let Some(rejection) = should_reject_text_prefill_request(
+            &self.memory_config,
+            &admission_snapshot,
+            &req.multimodal_inputs,
+        ) {
+            match rejection {
+                TextPrefillAdmissionRejection::HardCap { limit } => {
+                    warn!(
+                        id = %req.id,
+                        prompt_len,
+                        text_prefill_token_limit = limit,
+                        queue_waiting = self.scheduler.waiting.len(),
+                        queue_running = self.scheduler.running.len(),
+                        image_inputs = req.multimodal_inputs.image_urls.len(),
+                        audio_inputs = req.multimodal_inputs.audio_urls.len(),
+                        "Prompt exceeds text-only hard prefill cap, rejecting request",
+                    );
+                    let _ = req.response_tx.send(EngineResponse::Error(format!(
+                        "Prompt length ({prompt_len}) exceeds CRANE_TEXT_PREFILL_TOKEN_LIMIT ({limit}) for text-only requests while server max_seq_len is unlimited"
+                    )));
+                }
+                TextPrefillAdmissionRejection::Dynamic { estimate } => {
+                    warn!(
+                        id = %req.id,
+                        prompt_len,
+                        allowed_prompt_len_now = estimate.allowed_prompt_len_now,
+                        admission_reason = estimate.reason,
+                        gpu_used = %format_bytes_engine(admission_snapshot.gpu_used_bytes),
+                        configured_limit = %format_bytes_engine(estimate.configured_limit_bytes),
+                        reserve = %format_bytes_engine(estimate.reserve_bytes),
+                        tracked_kv = %format_bytes_engine(admission_snapshot.tracked_kv_bytes),
+                        queue_waiting = admission_snapshot.waiting_sequences,
+                        queue_running = admission_snapshot.running_sequences,
+                        image_inputs = req.multimodal_inputs.image_urls.len(),
+                        audio_inputs = req.multimodal_inputs.audio_urls.len(),
+                        "Prompt exceeds dynamic text-prefill budget, rejecting request",
+                    );
+                    let _ = req.response_tx.send(EngineResponse::Error(format!(
+                        "Prompt length ({prompt_len}) exceeds the current dynamic text-prefill budget: allowed prompt_len_now≈{} tokens (reason={}, gpu_used={}, configured_limit={}, reserve={}, tracked_kv={}, running={}, waiting={})",
+                        estimate.allowed_prompt_len_now,
+                        estimate.reason,
+                        format_bytes_engine(admission_snapshot.gpu_used_bytes),
+                        format_bytes_engine(estimate.configured_limit_bytes),
+                        format_bytes_engine(estimate.reserve_bytes),
+                        format_bytes_engine(admission_snapshot.tracked_kv_bytes),
+                        admission_snapshot.running_sequences,
+                        admission_snapshot.waiting_sequences,
+                    )));
+                }
+            }
             self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1788,7 +2108,11 @@ impl InferenceEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_probable_oom, should_reject_text_prefill_request, MemoryConfig};
+    use super::{
+        estimate_text_prefill_allowed_prompt_len, is_probable_oom,
+        should_reject_text_prefill_request, MemoryConfig, TextPrefillAdmissionConfig,
+        TextPrefillAdmissionMode, TextPrefillAdmissionRejection, TextPrefillAdmissionSnapshot,
+    };
     use crate::engine::runtime::{LayerKvCaches, RuntimeModel, RuntimeStepOutput};
     use crate::engine::sequence::{Sequence, SequenceStatus};
     use crate::engine::types::EngineResponse;
@@ -1920,17 +2244,36 @@ mod tests {
     }
 
     #[test]
-    fn text_prefill_guardrail_only_applies_to_unlimited_text_only_requests() {
+    fn text_prefill_hard_cap_only_applies_to_unlimited_text_only_requests() {
         let memory_config = MemoryConfig {
             max_seq_len: 0,
             text_prefill_token_limit: Some(2048),
+            text_prefill_admission: TextPrefillAdmissionConfig {
+                mode: TextPrefillAdmissionMode::Off,
+                reserve_bytes: 0,
+                bytes_per_token: 1,
+                running_penalty_tokens: 0,
+                waiting_penalty_tokens: 0,
+            },
             gpu_memory_limit_bytes: 0,
             baseline_gpu_bytes: 0,
         };
+        let snapshot = TextPrefillAdmissionSnapshot {
+            prompt_len: 4096,
+            gpu_used_bytes: 0,
+            gpu_total_bytes: 0,
+            tracked_kv_bytes: 0,
+            running_sequences: 0,
+            waiting_sequences: 0,
+        };
 
         assert_eq!(
-            should_reject_text_prefill_request(&memory_config, 4096, &MultimodalInputs::default()),
-            Some(2048)
+            should_reject_text_prefill_request(
+                &memory_config,
+                &snapshot,
+                &MultimodalInputs::default()
+            ),
+            Some(TextPrefillAdmissionRejection::HardCap { limit: 2048 })
         );
 
         assert_eq!(
@@ -1939,7 +2282,7 @@ mod tests {
                     max_seq_len: 8192,
                     ..memory_config.clone()
                 },
-                4096,
+                &snapshot,
                 &MultimodalInputs::default(),
             ),
             None
@@ -1948,11 +2291,120 @@ mod tests {
         assert_eq!(
             should_reject_text_prefill_request(
                 &memory_config,
-                4096,
+                &snapshot,
                 &MultimodalInputs {
                     image_urls: vec!["https://example.test/image.png".to_string()],
                     audio_urls: vec![],
                 },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn dynamic_text_prefill_estimator_reduces_budget_with_headroom_and_load() {
+        let memory_config = MemoryConfig {
+            max_seq_len: 0,
+            text_prefill_token_limit: None,
+            text_prefill_admission: TextPrefillAdmissionConfig {
+                mode: TextPrefillAdmissionMode::Dynamic,
+                reserve_bytes: 2_000,
+                bytes_per_token: 10,
+                running_penalty_tokens: 200,
+                waiting_penalty_tokens: 100,
+            },
+            gpu_memory_limit_bytes: 20_000,
+            baseline_gpu_bytes: 8_000,
+        };
+        let snapshot = TextPrefillAdmissionSnapshot {
+            prompt_len: 900,
+            gpu_used_bytes: 12_500,
+            gpu_total_bytes: 24_000,
+            tracked_kv_bytes: 500,
+            running_sequences: 2,
+            waiting_sequences: 1,
+        };
+
+        let estimate = estimate_text_prefill_allowed_prompt_len(&memory_config, &snapshot).unwrap();
+        assert_eq!(estimate.headroom_budget_bytes, 12_000);
+        assert_eq!(estimate.accounted_growth_bytes, 4_500);
+        assert_eq!(estimate.available_growth_bytes, 5_500);
+        assert_eq!(estimate.running_penalty_tokens, 400);
+        assert_eq!(estimate.waiting_penalty_tokens, 100);
+        assert_eq!(estimate.allowed_prompt_len_now, 50);
+        assert_eq!(estimate.reason, "gpu_headroom_and_queue_load");
+    }
+
+    #[test]
+    fn dynamic_text_prefill_rejects_when_prompt_exceeds_estimated_budget() {
+        let memory_config = MemoryConfig {
+            max_seq_len: 0,
+            text_prefill_token_limit: None,
+            text_prefill_admission: TextPrefillAdmissionConfig {
+                mode: TextPrefillAdmissionMode::Dynamic,
+                reserve_bytes: 2_000,
+                bytes_per_token: 10,
+                running_penalty_tokens: 200,
+                waiting_penalty_tokens: 100,
+            },
+            gpu_memory_limit_bytes: 20_000,
+            baseline_gpu_bytes: 8_000,
+        };
+        let snapshot = TextPrefillAdmissionSnapshot {
+            prompt_len: 900,
+            gpu_used_bytes: 12_500,
+            gpu_total_bytes: 24_000,
+            tracked_kv_bytes: 500,
+            running_sequences: 2,
+            waiting_sequences: 1,
+        };
+
+        match should_reject_text_prefill_request(
+            &memory_config,
+            &snapshot,
+            &MultimodalInputs::default(),
+        ) {
+            Some(TextPrefillAdmissionRejection::Dynamic { estimate }) => {
+                assert_eq!(estimate.allowed_prompt_len_now, 50);
+                assert_eq!(estimate.reason, "gpu_headroom_and_queue_load");
+            }
+            other => panic!("expected dynamic rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_text_prefill_skips_when_gpu_budget_is_not_observable() {
+        let memory_config = MemoryConfig {
+            max_seq_len: 0,
+            text_prefill_token_limit: None,
+            text_prefill_admission: TextPrefillAdmissionConfig {
+                mode: TextPrefillAdmissionMode::Dynamic,
+                reserve_bytes: 2_000,
+                bytes_per_token: 10,
+                running_penalty_tokens: 0,
+                waiting_penalty_tokens: 0,
+            },
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 8_000,
+        };
+        let snapshot = TextPrefillAdmissionSnapshot {
+            prompt_len: 9_000,
+            gpu_used_bytes: 0,
+            gpu_total_bytes: 0,
+            tracked_kv_bytes: 0,
+            running_sequences: 0,
+            waiting_sequences: 0,
+        };
+
+        assert_eq!(
+            estimate_text_prefill_allowed_prompt_len(&memory_config, &snapshot),
+            None
+        );
+        assert_eq!(
+            should_reject_text_prefill_request(
+                &memory_config,
+                &snapshot,
+                &MultimodalInputs::default()
             ),
             None
         );
