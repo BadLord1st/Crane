@@ -1,0 +1,6 @@
+ticket_id	ac_id	checked	text	spec_ids
+T-0001	AC-1	false	Crane starts successfully with the target smaller supported Gemma4 model and reaches healthy state.	SPEC-GEMMA-001,SPEC-GEMMA-003,SPEC-GEMMA-005
+T-0001	AC-2	false	Unsupported Gemma4 structure fails before serving traffic with a diagnostic compatibility error.	SPEC-GEMMA-002,SPEC-GEMMA-004
+T-0001	AC-3	false	Existing supported Gemma4 startup behavior remains intact for previously working variants.	SPEC-GEMMA-001,SPEC-GEMMA-005
+T-0002	AC-1	false	A CUDA Docker image containing the Gemma4 loader fix is built and published from my69.	SPEC-GEMMA-005
+T-0002	AC-2	false	Cluster deployment is updated to the new image and verified with health checks.	SPEC-GEMMA-005

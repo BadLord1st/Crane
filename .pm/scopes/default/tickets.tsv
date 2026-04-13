@@ -1,0 +1,3 @@
+id	state	title	owner	scope	spec_path	created_at	updated_at	deps	tags
+T-0001	in_progress	Make Gemma4 loading variant-compatible	Orchestrator	default	docs/spec/features/gemma4-variant-compatible-loading.md	2026-04-13T00:00:00Z	2026-04-13T00:00:00Z		gemma4,loader,cluster
+T-0002	pending	Build CUDA image and roll out fixed Crane	Orchestrator	default	docs/spec/features/gemma4-variant-compatible-loading.md	2026-04-13T00:00:00Z	2026-04-13T00:00:00Z	T-0001	release,docker,k8s

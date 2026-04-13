@@ -31,6 +31,8 @@ fn softmax_last_dim_fallback(xs: &Tensor) -> candle_core::Result<Tensor> {
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
     pub attention_bias: bool,
+    #[serde(default)]
+    pub attention_k_eq_v: bool,
     pub head_dim: usize,
     pub global_head_dim: Option<usize>,
     pub hidden_activation: Activation,
@@ -492,10 +494,11 @@ enum KvCache {
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
-    v_proj: Linear,
+    v_proj: Option<Linear>,
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    attention_k_eq_v: bool,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -520,7 +523,16 @@ impl Attention {
 
         let q_proj = linear(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"))?;
         let k_proj = linear(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?;
+        let v_proj = if cfg.attention_k_eq_v && !vb.pp("v_proj").contains_tensor("weight") {
+            None
+        } else {
+            Some(linear(
+                hidden_sz,
+                num_kv_heads * head_dim,
+                bias,
+                vb.pp("v_proj"),
+            )?)
+        };
         let o_proj = linear(num_heads * head_dim, hidden_sz, bias, vb.pp("o_proj"))?;
 
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
@@ -553,6 +565,7 @@ impl Attention {
             o_proj,
             q_norm,
             k_norm,
+            attention_k_eq_v: cfg.attention_k_eq_v,
             num_heads,
             num_kv_heads,
             num_kv_groups,
@@ -573,7 +586,13 @@ impl Attention {
 
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
+        let value_states = match &self.v_proj {
+            Some(v_proj) => v_proj.forward(xs)?,
+            None if self.attention_k_eq_v => key_states.clone(),
+            None => {
+                candle_core::bail!("missing v_proj for Gemma4 attention without attention_k_eq_v")
+            }
+        };
 
         let query_states = query_states
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -672,6 +691,137 @@ impl Attention {
                 let _ = c.append(&k, &v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_config(attention_k_eq_v: bool) -> Config {
+        Config {
+            attention_bias: false,
+            attention_k_eq_v,
+            head_dim: 2,
+            global_head_dim: None,
+            hidden_activation: Activation::Silu,
+            hidden_size: 4,
+            hidden_size_per_layer_input: None,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            num_key_value_heads: 1,
+            num_global_key_value_heads: None,
+            rms_norm_eps: 1e-6,
+            vocab_size: 16,
+            max_position_embeddings: 16,
+            sliding_window: 8,
+            layer_types: vec!["sliding_attention".to_string()],
+            final_logit_softcapping: None,
+            rope_parameters: None,
+            num_kv_shared_layers: None,
+            enable_moe_block: false,
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            expert_intermediate_size: None,
+            use_double_wide_mlp: None,
+            eos_token_id: None,
+        }
+    }
+
+    fn tensor_map(include_v_proj: bool) -> candle_core::Result<HashMap<String, Tensor>> {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+
+        for name in ["q_proj", "k_proj", "o_proj"] {
+            tensors.insert(
+                format!("{name}.weight"),
+                Tensor::zeros((4, 4), DType::F32, &device)?,
+            );
+        }
+        tensors.insert(
+            "k_proj.weight".to_string(),
+            Tensor::ones((2, 4), DType::F32, &device)?,
+        );
+        if include_v_proj {
+            tensors.insert(
+                "v_proj.weight".to_string(),
+                Tensor::ones((2, 4), DType::F32, &device)?,
+            );
+        }
+        tensors.insert(
+            "q_norm.weight".to_string(),
+            Tensor::ones(2, DType::F32, &device)?,
+        );
+        tensors.insert(
+            "k_norm.weight".to_string(),
+            Tensor::ones(2, DType::F32, &device)?,
+        );
+
+        Ok(tensors)
+    }
+
+    #[test]
+    fn config_deserialization_preserves_attention_k_eq_v_flag() {
+        let cfg: Config = serde_json::from_value(json!({
+            "attention_bias": false,
+            "attention_k_eq_v": true,
+            "head_dim": 2,
+            "hidden_activation": "silu",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 16,
+            "max_position_embeddings": 16,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention"]
+        }))
+        .expect("config should deserialize");
+
+        assert!(cfg.attention_k_eq_v);
+    }
+
+    #[test]
+    fn attention_allows_missing_v_proj_when_attention_k_eq_v_is_enabled() {
+        let cfg = test_config(true);
+        let vb = VarBuilder::from_tensors(
+            tensor_map(false).expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let mut attention =
+            Attention::new(&cfg, 0, vb).expect("attention should build without v_proj");
+        let xs =
+            Tensor::ones((1, 2, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
+
+        let (output, produced_kv) = attention
+            .forward(&xs, None, 0, None)
+            .expect("forward should reuse k projection as v");
+
+        assert_eq!(
+            output.dims3().expect("output dims"),
+            (1, 2, cfg.hidden_size)
+        );
+        assert!(produced_kv.is_some());
+    }
+
+    #[test]
+    fn attention_still_requires_v_proj_when_attention_k_eq_v_is_disabled() {
+        let cfg = test_config(false);
+        let vb = VarBuilder::from_tensors(
+            tensor_map(false).expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+
+        let err = Attention::new(&cfg, 0, vb).expect_err("v_proj should still be required");
+
+        assert!(err.to_string().contains("v_proj.weight"));
     }
 }
 
