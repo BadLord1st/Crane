@@ -312,7 +312,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "unlimited".to_string()),
     );
     info!(
-        "Model spec: text={}, multimodal={}, tool_call_tokens={}, batch_decode={}, kv_swap={}, chat_format={:?}, output_strategy={:?}",
+        "Model spec: text={}, multimodal={}, tool_call_tokens={}, batch_decode={}, kv_swap={}, chat_format={:?}, output_strategy={:?}, suggested_max_seq_len={}",
         model_spec.capabilities.text,
         model_spec.capabilities.multimodal,
         model_spec.capabilities.tool_call_tokens,
@@ -320,7 +320,21 @@ async fn main() -> Result<()> {
         model_spec.capabilities.kv_swap,
         model_spec.chat_format_strategy,
         model_spec.output_strategy,
+        model_spec
+            .limits
+            .suggested_max_seq_len
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
     );
+
+    if args.max_seq_len == 0 {
+        if let Some(suggested_max_seq_len) = model_spec.limits.suggested_max_seq_len {
+            info!(
+                suggested_max_seq_len,
+                "No explicit max_seq_len configured; consider setting --max-seq-len or CRANE_TEXT_PREFILL_TOKEN_LIMIT for long text-prefill protection"
+            );
+        }
+    }
 
     let using_default_batch = args.max_concurrent == 16 && args.decode_tokens_per_seq == 16;
     let using_unbounded_ctx = args.max_seq_len == 0;
@@ -664,12 +678,16 @@ async fn main() -> Result<()> {
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
         info!(
-            "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
+            "Memory config: max_seq_len={}, text_prefill_token_limit={}, gpu_limit={}, baseline_gpu={}, memory_init_ms={}",
             if memory_config.max_seq_len == 0 {
                 "unlimited".to_string()
             } else {
                 memory_config.max_seq_len.to_string()
             },
+            memory_config
+                .text_prefill_token_limit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "disabled".to_string()),
             if memory_config.gpu_memory_limit_bytes == 0 {
                 "unlimited".to_string()
             } else {
@@ -678,6 +696,12 @@ async fn main() -> Result<()> {
             format_bytes(baseline_gpu),
             memory_init_t0.elapsed().as_millis(),
         );
+        if memory_config.text_prefill_token_limit.is_some() {
+            info!(
+                text_prefill_token_limit = ?memory_config.text_prefill_token_limit,
+                "Text-only prefill guardrail enabled"
+            );
+        }
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(

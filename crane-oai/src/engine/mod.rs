@@ -66,6 +66,9 @@ use sequence::{Sequence, SequenceStatus};
 pub struct MemoryConfig {
     /// Maximum tokens per sequence (prompt + completion). 0 = unlimited.
     pub max_seq_len: usize,
+    /// Optional guardrail for text-only prompt prefill when max_seq_len is unlimited.
+    /// Parsed from `CRANE_TEXT_PREFILL_TOKEN_LIMIT`. `None` = disabled.
+    pub text_prefill_token_limit: Option<usize>,
     /// GPU memory limit in bytes. 0 = unlimited.
     /// This is an **absolute** limit on total GPU memory usage.
     pub gpu_memory_limit_bytes: u64,
@@ -87,10 +90,36 @@ impl MemoryConfig {
             Some(s) => Self::parse_memory_limit(s, device),
             None => 0,
         };
+        let text_prefill_token_limit = Self::parse_text_prefill_token_limit_env(
+            std::env::var("CRANE_TEXT_PREFILL_TOKEN_LIMIT").ok(),
+        );
         Self {
             max_seq_len,
+            text_prefill_token_limit,
             gpu_memory_limit_bytes,
             baseline_gpu_bytes: 0,
+        }
+    }
+
+    fn parse_text_prefill_token_limit_env(raw: Option<String>) -> Option<usize> {
+        let Some(raw) = raw else {
+            return None;
+        };
+
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0" {
+            return None;
+        }
+
+        match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => Some(limit),
+            _ => {
+                tracing::warn!(
+                    value = raw,
+                    "Could not parse CRANE_TEXT_PREFILL_TOKEN_LIMIT as a positive integer, ignoring"
+                );
+                None
+            }
         }
     }
 
@@ -153,6 +182,23 @@ impl MemoryConfig {
     }
 }
 
+fn should_reject_text_prefill_request(
+    memory_config: &MemoryConfig,
+    prompt_len: usize,
+    multimodal_inputs: &types::MultimodalInputs,
+) -> Option<usize> {
+    let limit = memory_config.text_prefill_token_limit?;
+    if memory_config.max_seq_len != 0 || !multimodal_inputs.is_empty() || prompt_len <= limit {
+        return None;
+    }
+    Some(limit)
+}
+
+fn is_probable_oom(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("out of memory") || lower.contains("cuda_error_out_of_memory")
+}
+
 /// Query current GPU memory usage. Returns (used_bytes, total_bytes).
 /// Returns (0, 0) if not on CUDA.
 fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
@@ -167,6 +213,84 @@ fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
         }
     }
     (0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_probable_oom, should_reject_text_prefill_request, MemoryConfig};
+    use crate::engine::types::MultimodalInputs;
+
+    #[test]
+    fn parse_text_prefill_token_limit_env_accepts_positive_integer() {
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("4096".to_string())),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn parse_text_prefill_token_limit_env_rejects_zero_and_invalid_values() {
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("0".to_string())),
+            None
+        );
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("abc".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn text_prefill_guardrail_only_applies_to_unlimited_text_only_requests() {
+        let memory_config = MemoryConfig {
+            max_seq_len: 0,
+            text_prefill_token_limit: Some(2048),
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+
+        assert_eq!(
+            should_reject_text_prefill_request(&memory_config, 4096, &MultimodalInputs::default()),
+            Some(2048)
+        );
+
+        assert_eq!(
+            should_reject_text_prefill_request(
+                &MemoryConfig {
+                    max_seq_len: 8192,
+                    ..memory_config.clone()
+                },
+                4096,
+                &MultimodalInputs::default(),
+            ),
+            None
+        );
+
+        assert_eq!(
+            should_reject_text_prefill_request(
+                &memory_config,
+                4096,
+                &MultimodalInputs {
+                    image_urls: vec!["https://example.test/image.png".to_string()],
+                    audio_urls: vec![],
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_probable_oom_messages() {
+        assert!(is_probable_oom(
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        assert!(is_probable_oom(
+            "CUDA out of memory while allocating tensor"
+        ));
+        assert!(!is_probable_oom(
+            "dtype mismatch in mul, lhs: BF16, rhs: F32"
+        ));
+    }
 }
 
 /// Format a byte count as a human-readable string (used in engine log messages).
@@ -312,7 +436,7 @@ impl InferenceEngine {
             }
         }
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, text_prefill_token_limit={})",
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
             if self.memory_config.max_seq_len == 0 {
@@ -320,6 +444,10 @@ impl InferenceEngine {
             } else {
                 self.memory_config.max_seq_len.to_string()
             },
+            self.memory_config
+                .text_prefill_token_limit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "disabled".to_string()),
         );
 
         loop {
@@ -715,6 +843,28 @@ impl InferenceEngine {
         let request_tokens = req.tokens.clone();
         let request_multimodal = req.multimodal_inputs.clone();
 
+        if let Some(limit) = should_reject_text_prefill_request(
+            &self.memory_config,
+            prompt_len,
+            &req.multimodal_inputs,
+        ) {
+            warn!(
+                id = %req.id,
+                prompt_len,
+                text_prefill_token_limit = limit,
+                queue_waiting = self.scheduler.waiting.len(),
+                queue_running = self.scheduler.running.len(),
+                image_inputs = req.multimodal_inputs.image_urls.len(),
+                audio_inputs = req.multimodal_inputs.audio_urls.len(),
+                "Prompt exceeds text-only prefill guardrail, rejecting request",
+            );
+            let _ = req.response_tx.send(EngineResponse::Error(format!(
+                "Prompt length ({prompt_len}) exceeds CRANE_TEXT_PREFILL_TOKEN_LIMIT ({limit}) for text-only requests while server max_seq_len is unlimited"
+            )));
+            self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         // Reject prompts that already exceed max_seq_len.
         if self.memory_config.max_seq_len > 0 && prompt_len > self.memory_config.max_seq_len {
             warn!(
@@ -872,11 +1022,33 @@ impl InferenceEngine {
         let logits = match self.model.prefill(RuntimeRequestContext {
             input_ids,
             start_pos,
-            multimodal_inputs,
+            multimodal_inputs: multimodal_inputs.clone(),
         }) {
             Ok(step) => step.logits,
             Err(e) => {
-                self.send_error(&seq_id, &format!("Prefill forward failed: {e}"));
+                let err = e.to_string();
+                let oom_context =
+                    self.prefill_oom_context(prompt_len, start_pos, &multimodal_inputs);
+                if is_probable_oom(&err) {
+                    error!(
+                        id = %seq_id,
+                        prompt_len,
+                        start_pos,
+                        queue_waiting = self.scheduler.waiting.len(),
+                        queue_running = self.scheduler.running.len(),
+                        image_inputs = multimodal_inputs.image_urls.len(),
+                        audio_inputs = multimodal_inputs.audio_urls.len(),
+                        oom_context = %oom_context,
+                        error = %err,
+                        "Prefill forward hit OOM"
+                    );
+                    self.send_error(
+                        &seq_id,
+                        &format!("Prefill forward failed: {err} [{oom_context}]"),
+                    );
+                } else {
+                    self.send_error(&seq_id, &format!("Prefill forward failed: {err}"));
+                }
                 return;
             }
         };
@@ -1514,6 +1686,57 @@ impl InferenceEngine {
         }
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
         self.cleanup_sequence(seq_id);
+    }
+
+    fn prefill_oom_context(
+        &self,
+        prompt_len: usize,
+        start_pos: usize,
+        multimodal_inputs: &types::MultimodalInputs,
+    ) -> String {
+        let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+        let mut fields = vec![
+            format!("prompt_len={prompt_len}"),
+            format!("start_pos={start_pos}"),
+            format!("queue_waiting={}", self.scheduler.waiting.len()),
+            format!("queue_running={}", self.scheduler.running.len()),
+            format!("image_inputs={}", multimodal_inputs.image_urls.len()),
+            format!("audio_inputs={}", multimodal_inputs.audio_urls.len()),
+            format!(
+                "text_prefill_token_limit={}",
+                self.memory_config
+                    .text_prefill_token_limit
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "disabled".to_string())
+            ),
+            format!(
+                "max_seq_len={}",
+                if self.memory_config.max_seq_len == 0 {
+                    "unlimited".to_string()
+                } else {
+                    self.memory_config.max_seq_len.to_string()
+                }
+            ),
+        ];
+
+        if gpu_total > 0 {
+            fields.push(format!("gpu_used={}", format_bytes_engine(gpu_used)));
+            fields.push(format!("gpu_total={}", format_bytes_engine(gpu_total)));
+            fields.push(format!(
+                "gpu_baseline={}",
+                format_bytes_engine(self.memory_config.baseline_gpu_bytes)
+            ));
+            fields.push(format!(
+                "gpu_limit={}",
+                if self.memory_config.gpu_memory_limit_bytes == 0 {
+                    "unlimited".to_string()
+                } else {
+                    format_bytes_engine(self.memory_config.gpu_memory_limit_bytes)
+                }
+            ));
+        }
+
+        fields.join(", ")
     }
 
     fn finish_sequence(&mut self, seq_id: &str) {

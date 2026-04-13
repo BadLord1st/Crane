@@ -10,5 +10,6 @@ pub use model_contract::{
     RuntimeStepOutput,
 };
 pub use model_spec::{
-    ChatFormatStrategy, ModelCapabilities, ModelSpec, OutputStrategy, SamplingDefaults,
+    ChatFormatStrategy, EngineLimitsProfile, ModelCapabilities, ModelSpec, OutputStrategy,
+    SamplingDefaults,
 };

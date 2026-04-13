@@ -14,8 +14,8 @@ use super::adapters::hunyuan_adapter::HunyuanRuntimeAdapter;
 use super::adapters::qwen25_adapter::Qwen25RuntimeAdapter;
 use super::adapters::qwen3_adapter::Qwen3RuntimeAdapter;
 use super::runtime::{
-    ChatFormatStrategy, ModelCapabilities as RuntimeCapabilities, ModelSpec, OutputStrategy,
-    RuntimeModel, SamplingDefaults,
+    ChatFormatStrategy, EngineLimitsProfile, ModelCapabilities as RuntimeCapabilities, ModelSpec,
+    OutputStrategy, RuntimeModel, SamplingDefaults,
 };
 use crate::chat_template::{
     AutoChatTemplate, ChatTemplateProcessor, Gemma4ChatTemplate, HunyuanChatTemplate,
@@ -261,12 +261,20 @@ pub fn create_model_spec(model_type: ModelType, model_path: &str) -> ModelSpec {
         capabilities.kv_swap = false;
     }
 
+    let limits = match resolved {
+        ModelType::Gemma4 => EngineLimitsProfile {
+            suggested_max_seq_len: Some(4096),
+            ..Default::default()
+        },
+        _ => EngineLimitsProfile::default(),
+    };
+
     ModelSpec {
         capabilities,
         chat_format_strategy,
         output_strategy,
         sampling_defaults,
-        limits: Default::default(),
+        limits,
     }
 }
 
@@ -664,5 +672,17 @@ mod tests {
     fn resolve_explicit_type_is_passthrough() {
         let result = resolve(ModelType::HunyuanDense, "/models/whatever");
         assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn create_model_spec_sets_gemma4_suggested_max_seq_len() {
+        let spec = create_model_spec(ModelType::Gemma4, "/models/gemma-4-foo");
+        assert_eq!(spec.limits.suggested_max_seq_len, Some(4096));
+    }
+
+    #[test]
+    fn create_model_spec_leaves_qwen_suggested_max_seq_len_unset() {
+        let spec = create_model_spec(ModelType::Qwen3, "/models/qwen3-foo");
+        assert_eq!(spec.limits.suggested_max_seq_len, None);
     }
 }
