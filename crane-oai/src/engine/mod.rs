@@ -215,84 +215,6 @@ fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     (0, 0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_probable_oom, should_reject_text_prefill_request, MemoryConfig};
-    use crate::engine::types::MultimodalInputs;
-
-    #[test]
-    fn parse_text_prefill_token_limit_env_accepts_positive_integer() {
-        assert_eq!(
-            MemoryConfig::parse_text_prefill_token_limit_env(Some("4096".to_string())),
-            Some(4096)
-        );
-    }
-
-    #[test]
-    fn parse_text_prefill_token_limit_env_rejects_zero_and_invalid_values() {
-        assert_eq!(
-            MemoryConfig::parse_text_prefill_token_limit_env(Some("0".to_string())),
-            None
-        );
-        assert_eq!(
-            MemoryConfig::parse_text_prefill_token_limit_env(Some("abc".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn text_prefill_guardrail_only_applies_to_unlimited_text_only_requests() {
-        let memory_config = MemoryConfig {
-            max_seq_len: 0,
-            text_prefill_token_limit: Some(2048),
-            gpu_memory_limit_bytes: 0,
-            baseline_gpu_bytes: 0,
-        };
-
-        assert_eq!(
-            should_reject_text_prefill_request(&memory_config, 4096, &MultimodalInputs::default()),
-            Some(2048)
-        );
-
-        assert_eq!(
-            should_reject_text_prefill_request(
-                &MemoryConfig {
-                    max_seq_len: 8192,
-                    ..memory_config.clone()
-                },
-                4096,
-                &MultimodalInputs::default(),
-            ),
-            None
-        );
-
-        assert_eq!(
-            should_reject_text_prefill_request(
-                &memory_config,
-                4096,
-                &MultimodalInputs {
-                    image_urls: vec!["https://example.test/image.png".to_string()],
-                    audio_urls: vec![],
-                },
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn detects_probable_oom_messages() {
-        assert!(is_probable_oom(
-            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
-        ));
-        assert!(is_probable_oom(
-            "CUDA out of memory while allocating tensor"
-        ));
-        assert!(!is_probable_oom(
-            "dtype mismatch in mul, lhs: BF16, rhs: F32"
-        ));
-    }
-}
-
 /// Format a byte count as a human-readable string (used in engine log messages).
 fn format_bytes_engine(bytes: u64) -> String {
     if bytes >= 1 << 30 {
@@ -1174,7 +1096,7 @@ impl InferenceEngine {
         self.recount_kv_bytes();
 
         // Collect KV caches and setup batched decode.
-        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+        let kv_caches: Vec<runtime::LayerKvCaches> = batch
             .iter()
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();
@@ -1834,5 +1756,83 @@ impl InferenceEngine {
         }
 
         debug!(id = %seq_id, "Sequence cleaned up");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_probable_oom, should_reject_text_prefill_request, MemoryConfig};
+    use crate::engine::types::MultimodalInputs;
+
+    #[test]
+    fn parse_text_prefill_token_limit_env_accepts_positive_integer() {
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("4096".to_string())),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn parse_text_prefill_token_limit_env_rejects_zero_and_invalid_values() {
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("0".to_string())),
+            None
+        );
+        assert_eq!(
+            MemoryConfig::parse_text_prefill_token_limit_env(Some("abc".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn text_prefill_guardrail_only_applies_to_unlimited_text_only_requests() {
+        let memory_config = MemoryConfig {
+            max_seq_len: 0,
+            text_prefill_token_limit: Some(2048),
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+
+        assert_eq!(
+            should_reject_text_prefill_request(&memory_config, 4096, &MultimodalInputs::default()),
+            Some(2048)
+        );
+
+        assert_eq!(
+            should_reject_text_prefill_request(
+                &MemoryConfig {
+                    max_seq_len: 8192,
+                    ..memory_config.clone()
+                },
+                4096,
+                &MultimodalInputs::default(),
+            ),
+            None
+        );
+
+        assert_eq!(
+            should_reject_text_prefill_request(
+                &memory_config,
+                4096,
+                &MultimodalInputs {
+                    image_urls: vec!["https://example.test/image.png".to_string()],
+                    audio_urls: vec![],
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_probable_oom_messages() {
+        assert!(is_probable_oom(
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        assert!(is_probable_oom(
+            "CUDA out of memory while allocating tensor"
+        ));
+        assert!(!is_probable_oom(
+            "dtype mismatch in mul, lhs: BF16, rhs: F32"
+        ));
     }
 }
