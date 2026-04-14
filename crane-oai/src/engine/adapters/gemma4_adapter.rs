@@ -1598,6 +1598,7 @@ mod tests {
         prefill_logits: Vec<f32>,
         teacher_forced_tokens: Vec<u32>,
         decode_logits_by_step: Vec<Vec<f32>>,
+        open_loop: OpenLoopParityTrace,
     }
 
     #[derive(Debug, Clone)]
@@ -1657,6 +1658,66 @@ mod tests {
         device: &Device,
         dtype: DType,
     ) -> DenseParityReference {
+        let (prompt_ids, prefill_logits, teacher_forced_tokens, decode_logits_by_step) = {
+            let mut dense = Gemma4RuntimeAdapter::new(
+                config.path_str(),
+                device,
+                &dtype,
+                KvBackendConfig {
+                    mode: KvCacheMode::Bf16Dense,
+                },
+            )
+            .expect("dense parity adapter");
+            let prompt_ids = encoded_prompt_ids(&dense, &config.prompt_text);
+            assert!(
+                !prompt_ids.is_empty(),
+                "real checkpoint parity prompt must tokenize to at least one token"
+            );
+            let prefill = dense
+                .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+                .expect("dense parity prefill");
+            let prefill_logits = tensor_to_vec_f32(&prefill.logits);
+
+            let mut previous_logits = prefill_logits.clone();
+            let mut teacher_forced_tokens = Vec::with_capacity(config.decode_steps);
+            let mut decode_logits_by_step = Vec::with_capacity(config.decode_steps);
+            for step in 0..config.decode_steps {
+                let token = argmax(&previous_logits) as u32;
+                teacher_forced_tokens.push(token);
+                let decode = dense
+                    .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                    .expect("dense parity decode");
+                let decode_logits = tensor_to_vec_f32(&decode.logits);
+                previous_logits = decode_logits.clone();
+                decode_logits_by_step.push(decode_logits);
+            }
+
+            (
+                prompt_ids,
+                prefill_logits,
+                teacher_forced_tokens,
+                decode_logits_by_step,
+            )
+        };
+
+        let open_loop =
+            collect_dense_open_loop_reference(config, device, dtype, prompt_ids.clone());
+
+        DenseParityReference {
+            prompt_ids,
+            prefill_logits,
+            teacher_forced_tokens,
+            decode_logits_by_step,
+            open_loop,
+        }
+    }
+
+    fn collect_dense_open_loop_reference(
+        config: &RealCheckpointHarnessConfig,
+        device: &Device,
+        dtype: DType,
+        prompt_ids: Vec<u32>,
+    ) -> OpenLoopParityTrace {
         let mut dense = Gemma4RuntimeAdapter::new(
             config.path_str(),
             device,
@@ -1665,37 +1726,19 @@ mod tests {
                 mode: KvCacheMode::Bf16Dense,
             },
         )
-        .expect("dense parity adapter");
-        let prompt_ids = encoded_prompt_ids(&dense, &config.prompt_text);
-        assert!(
-            !prompt_ids.is_empty(),
-            "real checkpoint parity prompt must tokenize to at least one token"
+        .expect("dense open-loop parity adapter");
+        let prefill_logits = tensor_to_vec_f32(
+            &dense
+                .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+                .expect("dense open-loop prefill")
+                .logits,
         );
-        let prefill = dense
-            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
-            .expect("dense parity prefill");
-        let prefill_logits = tensor_to_vec_f32(&prefill.logits);
-
-        let mut previous_logits = prefill_logits.clone();
-        let mut teacher_forced_tokens = Vec::with_capacity(config.decode_steps);
-        let mut decode_logits_by_step = Vec::with_capacity(config.decode_steps);
-        for step in 0..config.decode_steps {
-            let token = argmax(&previous_logits) as u32;
-            teacher_forced_tokens.push(token);
-            let decode = dense
-                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
-                .expect("dense parity decode");
-            let decode_logits = tensor_to_vec_f32(&decode.logits);
-            previous_logits = decode_logits.clone();
-            decode_logits_by_step.push(decode_logits);
-        }
-
-        DenseParityReference {
-            prompt_ids,
-            prefill_logits,
-            teacher_forced_tokens,
-            decode_logits_by_step,
-        }
+        collect_open_loop_trace(
+            &mut dense,
+            prompt_ids.len(),
+            &prefill_logits,
+            config.decode_steps,
+        )
     }
 
     fn collect_open_loop_trace(
@@ -1740,6 +1783,13 @@ mod tests {
             turbo_prefill_logits,
             decode_steps,
         );
+        compare_open_loop_traces(dense_trace, turbo_trace)
+    }
+
+    fn compare_open_loop_traces(
+        dense_trace: OpenLoopParityTrace,
+        turbo_trace: OpenLoopParityTrace,
+    ) -> OpenLoopParityComparison {
         let first_divergence_step = dense_trace
             .generated_tokens
             .iter()
@@ -3414,84 +3464,64 @@ mod tests {
         }
         drop(turbo_prefill);
 
-        let mut restored_turbo = Gemma4RuntimeAdapter::new(
-            config.path_str(),
-            &device,
-            &dtype,
-            KvBackendConfig {
-                mode: KvCacheMode::TurboQuant,
-            },
-        )
-        .expect("restored turbo parity adapter");
-        restored_turbo
-            .kv_restore(turbo_caches)
-            .expect("restore turbo caches");
+        let open_loop = {
+            let mut restored_turbo_open_loop = Gemma4RuntimeAdapter::new(
+                config.path_str(),
+                &device,
+                &dtype,
+                KvBackendConfig {
+                    mode: KvCacheMode::TurboQuant,
+                },
+            )
+            .expect("restored turbo open-loop parity adapter");
+            restored_turbo_open_loop
+                .kv_restore(turbo_caches_for_open_loop.clone())
+                .expect("restore turbo caches for open-loop parity");
 
-        let expected_enabled_layers = apply_turboquant_restore_support_boundary(
-            &(0..turbo_caches_for_open_loop.len())
-                .map(|layer_idx| {
-                    restored_turbo
-                        .turboquant_restore_layer_decision(layer_idx, &turbo_caches_for_open_loop)
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(layer_idx, decision)| {
-            decision.use_decode_prefix && restored_turbo.model.shared_kv_source(layer_idx).is_none()
-        })
-        .collect::<Vec<_>>();
-        let actual_enabled_layers = restored_turbo
-            .decode_prefix
-            .as_ref()
-            .map(|prefix| prefix.enabled_layers.clone())
-            .unwrap_or_else(|| vec![false; restored_turbo.num_layers()]);
-        assert_eq!(actual_enabled_layers, expected_enabled_layers);
-        eprintln!(
-            "[gemma4-real-parity] decode_prefix_enabled_layers={}/{} shared_kv={} sliding_layers={}",
-            actual_enabled_layers.iter().filter(|enabled| **enabled).count(),
-            actual_enabled_layers.len(),
-            restored_turbo.model.has_shared_kv_layers(),
-            (0..restored_turbo.num_layers())
-                .filter(|layer_idx| restored_turbo.model.layer_uses_sliding_window(*layer_idx))
-                .count(),
-        );
+            let expected_enabled_layers = apply_turboquant_restore_support_boundary(
+                &(0..turbo_caches_for_open_loop.len())
+                    .map(|layer_idx| {
+                        restored_turbo_open_loop.turboquant_restore_layer_decision(
+                            layer_idx,
+                            &turbo_caches_for_open_loop,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(layer_idx, decision)| {
+                decision.use_decode_prefix
+                    && restored_turbo_open_loop
+                        .model
+                        .shared_kv_source(layer_idx)
+                        .is_none()
+            })
+            .collect::<Vec<_>>();
+            let actual_enabled_layers = restored_turbo_open_loop
+                .decode_prefix
+                .as_ref()
+                .map(|prefix| prefix.enabled_layers.clone())
+                .unwrap_or_else(|| vec![false; restored_turbo_open_loop.num_layers()]);
+            assert_eq!(actual_enabled_layers, expected_enabled_layers);
+            eprintln!(
+                "[gemma4-real-parity] flow=sequential phases=dense_reference,turbo_prefill,turbo_open_loop_restore,turbo_teacher_forced_restore decode_prefix_enabled_layers={}/{} shared_kv={} sliding_layers={}",
+                actual_enabled_layers.iter().filter(|enabled| **enabled).count(),
+                actual_enabled_layers.len(),
+                restored_turbo_open_loop.model.has_shared_kv_layers(),
+                (0..restored_turbo_open_loop.num_layers())
+                    .filter(|layer_idx| restored_turbo_open_loop.model.layer_uses_sliding_window(*layer_idx))
+                    .count(),
+            );
 
-        let mut dense_open_loop = Gemma4RuntimeAdapter::new(
-            config.path_str(),
-            &device,
-            &dtype,
-            KvBackendConfig {
-                mode: KvCacheMode::Bf16Dense,
-            },
-        )
-        .expect("dense open-loop parity adapter");
-        let mut restored_turbo_open_loop = Gemma4RuntimeAdapter::new(
-            config.path_str(),
-            &device,
-            &dtype,
-            KvBackendConfig {
-                mode: KvCacheMode::TurboQuant,
-            },
-        )
-        .expect("restored turbo open-loop parity adapter");
-        restored_turbo_open_loop
-            .kv_restore(turbo_caches_for_open_loop)
-            .expect("restore turbo caches for open-loop parity");
-        let dense_open_loop_prefill_logits = tensor_to_vec_f32(
-            &dense_open_loop
-                .prefill(runtime_prefill_ctx(dense_reference.prompt_ids.clone()))
-                .expect("dense open-loop prefill")
-                .logits,
-        );
-        let open_loop = compare_open_loop_generation(
-            &mut dense_open_loop,
-            &mut restored_turbo_open_loop,
-            dense_reference.prompt_ids.len(),
-            &dense_open_loop_prefill_logits,
-            &turbo_prefill_logits,
-            config.decode_steps,
-        );
+            let restored_turbo_trace = collect_open_loop_trace(
+                &mut restored_turbo_open_loop,
+                dense_reference.prompt_ids.len(),
+                &turbo_prefill_logits,
+                config.decode_steps,
+            );
+            compare_open_loop_traces(dense_reference.open_loop.clone(), restored_turbo_trace)
+        };
         eprintln!(
             "[gemma4-real-parity] open_loop_dense_tokens={:?} open_loop_turbo_tokens={:?} first_divergence_step={:?}",
             open_loop.dense.generated_tokens,
@@ -3522,6 +3552,19 @@ mod tests {
             open_loop.dense.generated_tokens,
             open_loop.turbo.generated_tokens,
         );
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            &device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo parity adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
 
         for (step, token) in dense_reference
             .teacher_forced_tokens

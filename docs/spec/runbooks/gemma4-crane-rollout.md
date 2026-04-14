@@ -89,10 +89,16 @@ cargo test -p crane-oai gemma4_real_checkpoint_turboquant_restore_parity_harness
 
 Notes:
 - Run this only on a machine/pod where the real checkpoint path is mounted and a suitable accelerator is available.
-- The harness loads the real checkpoint sequentially in `bf16_dense` and `turboquant` modes, then restores TurboQuant KV into a fresh adapter to exercise the actual restore path.
+- The harness is now intentionally **memory-light and sequential** for smaller single-GPU hosts:
+  - phase 1: collect dense reference evidence
+  - phase 2: run TurboQuant prefill and extract KV
+  - phase 3: restore TurboQuant KV into a fresh adapter for open-loop evidence
+  - phase 4: restore TurboQuant KV again into a fresh adapter for teacher-forced decode-step parity
+- This avoids keeping dense + TurboQuant model weights resident at the same time during open-loop comparison.
 - The harness is expected to print lines beginning with `[gemma4-real-parity]` that include:
   - selected device/dtype and checkpoint path
   - prompt token count and decode-step count
+  - `flow=sequential` with phase labels for grep-friendly confirmation of the lower-memory path
   - prefill dense/turbo top-1 token IDs and max-abs logit drift
   - enabled decode-prefix layer count vs total layer count
   - open-loop dense/turbo generated token streams and the first divergence step, if any
@@ -112,6 +118,7 @@ Pass condition:
 - every compared decode step keeps dense/turbo top-1 agreement
 - extracted restored KV payloads remain `TurboQuant` envelopes
 - on the supported narrow V path, backend aggregation now consumes backend-owned grouped-int8 value metadata first; rowwise dense reconstruction remains the explicit fallback/import path
+- this slice reduces peak harness memory, but does **not** reduce the cost of loading the real 26B checkpoint itself
 
 Failure interpretation:
 - if the checkpoint path is inaccessible, the test fails immediately with a path/configuration message
