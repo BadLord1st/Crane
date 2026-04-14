@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use candle_core::{DType, Device, Tensor};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -11,12 +11,17 @@ use crate::engine::runtime::{
     RuntimeStateDelta, RuntimeStepContext, RuntimeStepOutput, SequenceKvCaches,
 };
 
+const TURBOQUANT_EXACT_RECENT_TOKENS: usize = 8;
+const TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurboQuantPathReason {
     SupportedNarrowPath,
+    HistoryTooShort,
     MixedLayerRestoreUnsupported,
     MissingStoredKv,
     BackendNoCompressedKScores,
+    StoredKeyScoringUnsupported,
     BackendBatchDecodeUnsupported,
     SharedKvUnsupported,
     SlidingWindowUnsupported,
@@ -30,9 +35,11 @@ impl TurboQuantPathReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::SupportedNarrowPath => "supported_narrow_path",
+            Self::HistoryTooShort => "history_too_short",
             Self::MixedLayerRestoreUnsupported => "mixed_layer_restore_unsupported",
             Self::MissingStoredKv => "missing_stored_kv",
             Self::BackendNoCompressedKScores => "backend_no_compressed_k_scores",
+            Self::StoredKeyScoringUnsupported => "stored_key_scoring_unsupported",
             Self::BackendBatchDecodeUnsupported => "backend_batch_decode_unsupported",
             Self::SharedKvUnsupported => "shared_kv_unsupported",
             Self::SlidingWindowUnsupported => "sliding_window_unsupported",
@@ -48,13 +55,17 @@ impl TurboQuantPathReason {
 struct TurboQuantLayerDecision {
     use_decode_prefix: bool,
     reason: TurboQuantPathReason,
+    compressed_prefix_len: usize,
+    exact_recent_len: usize,
 }
 
 impl TurboQuantLayerDecision {
-    fn supported() -> Self {
+    fn supported(compressed_prefix_len: usize, exact_recent_len: usize) -> Self {
         Self {
             use_decode_prefix: true,
             reason: TurboQuantPathReason::SupportedNarrowPath,
+            compressed_prefix_len,
+            exact_recent_len,
         }
     }
 
@@ -62,6 +73,8 @@ impl TurboQuantLayerDecision {
         Self {
             use_decode_prefix: false,
             reason,
+            compressed_prefix_len: 0,
+            exact_recent_len: 0,
         }
     }
 
@@ -74,17 +87,89 @@ impl TurboQuantLayerDecision {
     }
 }
 
+fn classify_turboquant_hybrid_history(
+    seq_len: usize,
+) -> std::result::Result<(usize, usize), TurboQuantPathReason> {
+    let exact_recent_len = seq_len.min(TURBOQUANT_EXACT_RECENT_TOKENS);
+    let compressed_prefix_len = seq_len.saturating_sub(exact_recent_len);
+    if compressed_prefix_len < TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS {
+        return Err(TurboQuantPathReason::HistoryTooShort);
+    }
+    Ok((compressed_prefix_len, exact_recent_len))
+}
+
+fn split_dense_history_at_prefix_len(
+    dense: DenseLayerKv,
+    compressed_prefix_len: usize,
+) -> Result<(DenseLayerKv, DenseLayerKv)> {
+    let Some((key, value)) = dense else {
+        return Ok((None, None));
+    };
+
+    let (batch, key_heads, seq_len, key_width) = key.dims4()?;
+    let (value_batch, value_heads, value_seq_len, value_width) = value.dims4()?;
+    if seq_len != value_seq_len {
+        bail!(
+            "Dense KV sequence length mismatch while splitting hybrid TurboQuant history: key_seq_len={} value_seq_len={}",
+            seq_len,
+            value_seq_len
+        );
+    }
+    if compressed_prefix_len > seq_len {
+        bail!(
+            "Hybrid TurboQuant prefix length {} exceeds dense KV seq_len {}",
+            compressed_prefix_len,
+            seq_len
+        );
+    }
+
+    let exact_recent_len = seq_len - compressed_prefix_len;
+    let prefix = if compressed_prefix_len == 0 {
+        None
+    } else {
+        Some((
+            key.narrow(2, 0, compressed_prefix_len)?
+                .reshape((batch, key_heads, compressed_prefix_len, key_width))?
+                .contiguous()?,
+            value
+                .narrow(2, 0, compressed_prefix_len)?
+                .reshape((value_batch, value_heads, compressed_prefix_len, value_width))?
+                .contiguous()?,
+        ))
+    };
+    let recent = if exact_recent_len == 0 {
+        None
+    } else {
+        Some((
+            key.narrow(2, compressed_prefix_len, exact_recent_len)?
+                .reshape((batch, key_heads, exact_recent_len, key_width))?
+                .contiguous()?,
+            value
+                .narrow(2, compressed_prefix_len, exact_recent_len)?
+                .reshape((value_batch, value_heads, exact_recent_len, value_width))?
+                .contiguous()?,
+        ))
+    };
+    Ok((prefix, recent))
+}
+
 fn classify_turboquant_restore_layer(
     backend_supports_compressed_k_scores: bool,
+    stored_supports_compressed_k_scores: bool,
     has_shared_kv_layers: bool,
     layer_uses_sliding_window: bool,
-    has_stored_kv: bool,
+    stored_seq_len: Option<usize>,
 ) -> TurboQuantLayerDecision {
-    if !has_stored_kv {
+    let Some(stored_seq_len) = stored_seq_len else {
         return TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv);
-    }
+    };
     if !backend_supports_compressed_k_scores {
         return TurboQuantLayerDecision::fallback(TurboQuantPathReason::BackendNoCompressedKScores);
+    }
+    if !stored_supports_compressed_k_scores {
+        return TurboQuantLayerDecision::fallback(
+            TurboQuantPathReason::StoredKeyScoringUnsupported,
+        );
     }
     if has_shared_kv_layers {
         return TurboQuantLayerDecision::fallback(TurboQuantPathReason::SharedKvUnsupported);
@@ -92,7 +177,12 @@ fn classify_turboquant_restore_layer(
     if layer_uses_sliding_window {
         return TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported);
     }
-    TurboQuantLayerDecision::supported()
+    let Ok((compressed_prefix_len, exact_recent_len)) =
+        classify_turboquant_hybrid_history(stored_seq_len)
+    else {
+        return TurboQuantLayerDecision::fallback(TurboQuantPathReason::HistoryTooShort);
+    };
+    TurboQuantLayerDecision::supported(compressed_prefix_len, exact_recent_len)
 }
 
 fn apply_turboquant_restore_support_boundary(
@@ -369,10 +459,35 @@ impl Gemma4RuntimeAdapter {
     ) -> TurboQuantLayerDecision {
         classify_turboquant_restore_layer(
             self.kv_backend.supports_compressed_k_scores(),
+            stored
+                .as_ref()
+                .and_then(|stored| {
+                    self.kv_backend
+                        .supports_stored_compressed_k_scores(stored)
+                        .ok()
+                })
+                .unwrap_or(false),
             self.model.has_shared_kv_layers(),
             self.model.layer_uses_sliding_window(layer_idx),
-            stored.is_some(),
+            stored.as_ref().map(|stored| stored.seq_len),
         )
+    }
+
+    fn restore_hybrid_turboquant_layer(
+        &self,
+        layer_idx: usize,
+        stored: Option<KvLayerEnvelope>,
+        decision: TurboQuantLayerDecision,
+    ) -> Result<(Option<KvLayerEnvelope>, DenseLayerKv)> {
+        let dense = self
+            .kv_backend
+            .import_layer(layer_idx, stored, self.device(), self.dtype())?;
+        let (compressed_history_dense, exact_recent_dense) =
+            split_dense_history_at_prefix_len(dense, decision.compressed_prefix_len)?;
+        let compressed_history = self
+            .kv_backend
+            .export_layer(layer_idx, compressed_history_dense)?;
+        Ok((compressed_history, exact_recent_dense))
     }
 
     fn log_turboquant_restore_decisions(&self, decisions: &[TurboQuantLayerDecision]) {
@@ -385,6 +500,14 @@ impl Gemma4RuntimeAdapter {
             .filter(|decision| decision.use_decode_prefix)
             .count();
         let fallback_layers = stored_layers.saturating_sub(active_layers);
+        let compressed_history_tokens: usize = decisions
+            .iter()
+            .map(|decision| decision.compressed_prefix_len)
+            .sum();
+        let exact_recent_tokens: usize = decisions
+            .iter()
+            .map(|decision| decision.exact_recent_len)
+            .sum();
         info!(
             event = "gemma4_turboquant_restore_summary",
             backend = self.kv_backend.backend_id(),
@@ -403,6 +526,10 @@ impl Gemma4RuntimeAdapter {
             active_layers,
             fallback_layers,
             stored_layers,
+            compressed_history_tokens,
+            exact_recent_tokens,
+            exact_recent_buffer_tokens = TURBOQUANT_EXACT_RECENT_TOKENS,
+            min_compressed_history_tokens = TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS,
             total_layers = decisions.len(),
             shared_kv = self.model.has_shared_kv_layers(),
             "Gemma4 TurboQuant restore decisions evaluated"
@@ -418,6 +545,8 @@ impl Gemma4RuntimeAdapter {
                 layer_idx,
                 decision = decision.decision_label(),
                 reason = decision.reason.as_str(),
+                compressed_history_tokens = decision.compressed_prefix_len,
+                exact_recent_tokens = decision.exact_recent_len,
                 sliding_window = self.model.layer_uses_sliding_window(layer_idx),
                 shared_kv = self.model.has_shared_kv_layers(),
                 "Gemma4 TurboQuant restore layer decision"
@@ -627,33 +756,32 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
             .iter()
             .map(|decision| decision.use_decode_prefix)
             .collect();
-        let dense = caches
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, stored)| {
-                let use_decode_prefix = layer_decisions[layer_idx].use_decode_prefix;
-                let dense = if use_decode_prefix {
-                    Ok(None)
-                } else {
-                    self.kv_backend.import_layer(
-                        layer_idx,
-                        stored.clone(),
-                        self.device(),
-                        self.dtype(),
-                    )
-                };
-                dense.map_err(|err| {
-                    anyhow::anyhow!(
-                        "Gemma4 KV restore failed for layer {} with backend '{}': {err}",
-                        layer_idx,
-                        self.kv_backend.backend_id()
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut prefix_caches = Vec::with_capacity(caches.len());
+        let mut dense = Vec::with_capacity(caches.len());
+        for (layer_idx, stored) in caches.iter().cloned().enumerate() {
+            let decision = layer_decisions[layer_idx];
+            let restored = if decision.use_decode_prefix {
+                self.restore_hybrid_turboquant_layer(layer_idx, stored, decision)
+                    .map(|(compressed_history, exact_recent_dense)| {
+                        prefix_caches.push(compressed_history);
+                        exact_recent_dense
+                    })
+            } else {
+                prefix_caches.push(None);
+                self.kv_backend
+                    .import_layer(layer_idx, stored, self.device(), self.dtype())
+            };
+            dense.push(restored.map_err(|err| {
+                anyhow::anyhow!(
+                    "Gemma4 KV restore failed for layer {} with backend '{}': {err}",
+                    layer_idx,
+                    self.kv_backend.backend_id()
+                )
+            })?);
+        }
         self.model.set_kv_caches(dense);
         self.log_turboquant_restore_decisions(&layer_decisions);
-        self.maybe_enable_decode_prefix(&caches, enabled_layers);
+        self.maybe_enable_decode_prefix(&prefix_caches, enabled_layers);
         Ok(())
     }
 
@@ -1585,24 +1713,42 @@ mod tests {
     #[test]
     fn turboquant_restore_layer_decisions_are_bounded_and_explicit() {
         assert_eq!(
-            classify_turboquant_restore_layer(true, false, false, true),
-            TurboQuantLayerDecision::supported()
+            classify_turboquant_restore_layer(true, true, false, false, Some(24)),
+            TurboQuantLayerDecision::supported(16, 8)
         );
         assert_eq!(
-            classify_turboquant_restore_layer(false, false, false, true),
+            classify_turboquant_restore_layer(false, false, false, false, Some(24)),
             TurboQuantLayerDecision::fallback(TurboQuantPathReason::BackendNoCompressedKScores)
         );
         assert_eq!(
-            classify_turboquant_restore_layer(true, true, false, true),
+            classify_turboquant_restore_layer(true, false, false, false, Some(24)),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::StoredKeyScoringUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(true, true, true, false, Some(24)),
             TurboQuantLayerDecision::fallback(TurboQuantPathReason::SharedKvUnsupported)
         );
         assert_eq!(
-            classify_turboquant_restore_layer(true, false, true, true),
+            classify_turboquant_restore_layer(true, true, false, true, Some(24)),
             TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported)
         );
         assert_eq!(
-            classify_turboquant_restore_layer(true, false, false, false),
+            classify_turboquant_restore_layer(true, true, false, false, Some(23)),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::HistoryTooShort)
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(true, false, false, false, None),
             TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv)
+        );
+    }
+
+    #[test]
+    fn turboquant_hybrid_history_policy_is_explicit() {
+        assert_eq!(classify_turboquant_hybrid_history(24), Ok((16, 8)));
+        assert_eq!(classify_turboquant_hybrid_history(31), Ok((23, 8)));
+        assert_eq!(
+            classify_turboquant_hybrid_history(23),
+            Err(TurboQuantPathReason::HistoryTooShort)
         );
     }
 
@@ -1610,9 +1756,9 @@ mod tests {
     fn turboquant_restore_support_boundary_rejects_partial_hybrid_restore() {
         assert_eq!(
             apply_turboquant_restore_support_boundary(&[
-                TurboQuantLayerDecision::supported(),
+                TurboQuantLayerDecision::supported(16, 8),
                 TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported),
-                TurboQuantLayerDecision::supported(),
+                TurboQuantLayerDecision::supported(16, 8),
                 TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv),
             ]),
             vec![
@@ -2354,6 +2500,148 @@ mod tests {
     }
 
     #[test]
+    fn turboquant_runtime_checkpoint_fixture_falls_back_when_history_is_too_short_for_hybrid_prefix(
+    ) {
+        let fixture = RuntimeCheckpointFixture::new(3);
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+        let prompt_ids = encoded_prompt_ids(&turbo_prefill, fixture.prompt_text);
+        assert!(
+            prompt_ids.len()
+                < TURBOQUANT_EXACT_RECENT_TOKENS + TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS
+        );
+
+        turbo_prefill
+            .prefill(runtime_prefill_ctx(prompt_ids))
+            .expect("turbo prefill");
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        assert!(restored_turbo.decode_prefix.is_none());
+        let restored_dense = restored_turbo.model.get_kv_caches();
+        assert_eq!(restored_dense.len(), restored_turbo.num_layers());
+        assert!(restored_dense.iter().all(|layer| {
+            layer
+                .as_ref()
+                .map(|(key, _)| key.dim(2).expect("kv seq len") == 2)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn turboquant_runtime_checkpoint_fixture_uses_compressed_history_plus_exact_recent_buffer() {
+        let fixture = RuntimeCheckpointFixture::with_layout(
+            &["full_attention", "full_attention", "full_attention"],
+            8,
+            "tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok1 tok2 tok3",
+        );
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        assert_eq!(
+            prompt_ids.len(),
+            TURBOQUANT_EXACT_RECENT_TOKENS + TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS
+        );
+        let dense_prefill_logits = tensor_to_vec_f32(
+            &dense
+                .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+                .expect("dense prefill")
+                .logits,
+        );
+        turbo_prefill
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("turbo prefill");
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let prefix = restored_turbo
+            .decode_prefix
+            .as_ref()
+            .expect("hybrid prefix should be enabled");
+        assert_eq!(prefix.enabled_layers, vec![true, true, true]);
+        assert!(prefix.caches.iter().all(|stored| {
+            stored
+                .as_ref()
+                .map(|stored| stored.seq_len == TURBOQUANT_MIN_COMPRESSED_HISTORY_TOKENS)
+                .unwrap_or(false)
+        }));
+        let dense_recent = restored_turbo.model.get_kv_caches();
+        assert!(dense_recent.iter().all(|layer| {
+            layer
+                .as_ref()
+                .map(|(key, _)| {
+                    key.dim(2).expect("recent seq len") == TURBOQUANT_EXACT_RECENT_TOKENS
+                })
+                .unwrap_or(false)
+        }));
+
+        let first_token = argmax(&dense_prefill_logits) as u32;
+        let dense_decode = dense
+            .decode(runtime_decode_ctx(first_token, prompt_ids.len()))
+            .expect("dense decode");
+        let turbo_decode = restored_turbo
+            .decode(runtime_decode_ctx(first_token, prompt_ids.len()))
+            .expect("hybrid turbo decode");
+        let dense_logits = tensor_to_vec_f32(&dense_decode.logits);
+        let turbo_logits = tensor_to_vec_f32(&turbo_decode.logits);
+
+        assert_eq!(argmax(&dense_logits), argmax(&turbo_logits));
+        assert_top_k_match(&dense_logits, &turbo_logits, 3);
+        assert!(
+            max_abs_diff(&dense_logits, &turbo_logits) <= 0.45,
+            "dense={dense_logits:?} turbo={turbo_logits:?}"
+        );
+    }
+
+    #[test]
     fn turboquant_runtime_checkpoint_fixture_records_open_loop_divergence_boundary() {
         let fixture = RuntimeCheckpointFixture::new(3);
         let mut dense = Gemma4RuntimeAdapter::new(
@@ -2535,9 +2823,12 @@ mod tests {
                 .map(|layer_idx| {
                     classify_turboquant_restore_layer(
                         true,
+                        true,
                         false,
                         layer_idx > 0,
-                        turbo_caches[layer_idx].is_some(),
+                        turbo_caches[layer_idx]
+                            .as_ref()
+                            .map(|stored| stored.seq_len),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2679,9 +2970,18 @@ mod tests {
                 .map(|(layer_idx, stored)| {
                     classify_turboquant_restore_layer(
                         restored_turbo.kv_backend.supports_compressed_k_scores(),
+                        stored
+                            .as_ref()
+                            .and_then(|stored| {
+                                restored_turbo
+                                    .kv_backend
+                                    .supports_stored_compressed_k_scores(stored)
+                                    .ok()
+                            })
+                            .unwrap_or(false),
                         restored_turbo.model.has_shared_kv_layers(),
                         restored_turbo.model.layer_uses_sliding_window(layer_idx),
-                        stored.is_some(),
+                        stored.as_ref().map(|stored| stored.seq_len),
                     )
                 })
                 .collect::<Vec<_>>(),
