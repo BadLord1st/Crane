@@ -44,6 +44,7 @@ Fix Crane so it can load the target smaller Gemma4 variant from the cluster PVC,
 ## Artifact Index
 - primary spec: docs/spec/features/gemma4-variant-compatible-loading.md
 - secondary specs: docs/spec/runbooks/gemma4-crane-rollout.md
+- planning: .opencode/handoff/2026-04-13-gemma4-loader-fix/90-turboquant-next-steps.md
 - code paths: crane-core/src/models/gemma4/model.rs; crane-core/src/models/gemma4/modeling.rs; crane-oai/src/engine/model_factory.rs; crane-oai/src/engine/adapters/gemma4_adapter.rs
 - test paths: pending
 - evidence: pending
@@ -64,3 +65,8 @@ Fix Crane so it can load the target smaller Gemma4 variant from the cluster PVC,
 - Likely hot spot is Gemma4 MoE routing in `crane-core/src/models/gemma4/modeling.rs`, especially `gather` over tensors produced by softmax/expand in `Gemma4TextRouter::route`.
 - After fixing gather contiguity and re-rolling out, live inference advanced further but now fails with `Prefill forward failed: dtype mismatch in mul, lhs: BF16, rhs: F32`.
 - Likely hot spot is `Gemma4TextExperts::forward`, where routing weights are reconstructed as default F32 tensors before multiplying BF16 expert outputs.
+- Perf follow-up: real H100 PCIe confirmed, MIG disabled, decode remains ~15-16 tok/s while prefill is ~174 tok/s.
+- Perf analysis indicates primary bottleneck is Gemma4 MoE routing/dispatch via GPU->CPU->GPU round-trips in `crane-core/src/models/gemma4/modeling.rs`, with sequential decode in `crane-oai` as a secondary architectural limit.
+- Next slice approved: add explicit decode TPS / phase timings in engine logs and Gemma4 per-layer perf logs under an env-gated trace path to confirm hotspot distribution before larger optimization work.
+- Real PVC checkpoint TurboQuant parity harness was eventually executed against `/models/google/gemma-4-26B-A4B-it/1db3cff1840c2ae59759d8e842ff37831cf8cb63` and completed with a parity failure before the mixed-restore drift fix was validated on real hardware.
+- Recorded result from harness: prefill top-1 matched; decode step 0 matched; decode step 1 diverged (`dense=101`, `turbo=236772`) with `decode_prefix_enabled_layers=5/30`, confirming mixed restore was not parity-safe on the real checkpoint.

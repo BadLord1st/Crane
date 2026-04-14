@@ -1001,6 +1001,10 @@ impl Model {
         self.inner.has_shared_kv_layers()
     }
 
+    pub fn shared_kv_source(&self, layer_idx: usize) -> Option<usize> {
+        self.inner.shared_kv_source(layer_idx)
+    }
+
     pub fn layer_uses_sliding_window(&self, layer_idx: usize) -> bool {
         self.inner.layer_uses_sliding_window(layer_idx)
     }

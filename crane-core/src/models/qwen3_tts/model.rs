@@ -68,8 +68,7 @@ impl SpeechTokenizerDecoder {
 
     /// Decode `[batch, num_quantizers, seq_len]` codes → `[batch, 1, samples]`.
     pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        let inputs =
-            std::collections::HashMap::from_iter([("codes".to_string(), codes.clone())]);
+        let inputs = std::collections::HashMap::from_iter([("codes".to_string(), codes.clone())]);
         let out = candle_onnx::simple_eval(&self.model, inputs)?;
         let out_names = &self.model.graph.as_ref().unwrap().output;
         let audio = out.get(&out_names[0].name).unwrap().clone();
@@ -84,7 +83,10 @@ impl SpeechTokenizerDecoder {
 
     pub fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
         let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
+        let scaled = audio
+            .affine(32767.0, 0.0)?
+            .clamp(-32768.0, 32767.0)?
+            .round()?;
         let audio_i64 = scaled.to_dtype(DType::I64)?;
         let spec = WavSpec {
             channels: 1,
@@ -230,10 +232,7 @@ impl Model {
     ///
     /// Returns raw text tokens (no ChatML wrapping).
     /// The role prefix is added by the talker prefill construction.
-    pub fn prepare_tts_input(
-        &self,
-        text: &str,
-    ) -> Result<Vec<u32>> {
+    pub fn prepare_tts_input(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self.tokenizer.encode(text, false).map_err(E::msg)?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -269,10 +268,9 @@ impl Model {
             anyhow::bail!("No speech codes generated");
         }
 
-        let speech_decoder = self
-            .speech_decoder
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Speech tokenizer decoder not loaded; cannot decode to audio"))?;
+        let speech_decoder = self.speech_decoder.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Speech tokenizer decoder not loaded; cannot decode to audio")
+        })?;
 
         // Convert codes: Vec<Vec<u32>> of shape [timesteps, num_code_groups]
         // → Tensor [1, num_code_groups, timesteps]
@@ -373,7 +371,10 @@ impl Model {
         let audio = audio.to_dtype(DType::F32)?.flatten_all()?;
 
         // Scale to i16 PCM
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
+        let scaled = audio
+            .affine(32767.0, 0.0)?
+            .clamp(-32768.0, 32767.0)?
+            .round()?;
         let samples = scaled.to_dtype(DType::I64)?.to_vec1::<i64>()?;
 
         let mut pcm_bytes = Vec::with_capacity(samples.len() * 2);
@@ -398,11 +399,7 @@ impl Model {
     ///
     /// Input: f32 samples in [-1, 1], length N.
     /// Output: Tensor `[1, T_frames, num_mels]` on `device` in `dtype`.
-    fn compute_mel_spectrogram(
-        samples: &[f32],
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Tensor> {
+    fn compute_mel_spectrogram(samples: &[f32], device: &Device, dtype: DType) -> Result<Tensor> {
         const N_FFT: usize = 1024;
         const NUM_MELS: usize = 128;
         const SR: usize = 24000;
@@ -413,7 +410,9 @@ impl Model {
 
         // Hann window
         let hann: Vec<f32> = (0..WIN)
-            .map(|i| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / WIN as f64).cos()) as f32)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / WIN as f64).cos()) as f32
+            })
             .collect();
 
         // Reflect pad: (n_fft - hop) / 2 = (1024 - 256) / 2 = 384
@@ -447,7 +446,7 @@ impl Model {
         // Compute magnitude spectrogram frame by frame using rustfft (O(N log N))
         let mut mel_frames: Vec<f32> = Vec::with_capacity(n_frames * NUM_MELS);
 
-        use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
+        use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(N_FFT);
 
@@ -501,23 +500,39 @@ impl Model {
     ///
     /// Slaney scale: linear below 1000 Hz, logarithmic above.
     /// This matches `librosa.filters.mel(norm="slaney", htk=False)`.
-    fn build_mel_filterbank(sr: usize, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<f32> {
+    fn build_mel_filterbank(
+        sr: usize,
+        n_fft: usize,
+        n_mels: usize,
+        fmin: f64,
+        fmax: f64,
+    ) -> Vec<f32> {
         // Slaney / O'Shaughnessy mel scale
-        const F_SP: f64 = 200.0 / 3.0;    // ~66.667 Hz per mel below breakpoint
+        const F_SP: f64 = 200.0 / 3.0; // ~66.667 Hz per mel below breakpoint
         const MIN_LOG_HZ: f64 = 1000.0;
         const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
-        // ln(6.4) / 27 ≈ 0.068751739
+                                                    // ln(6.4) / 27 ≈ 0.068751739
         const LOG_STEP: f64 = 0.068_751_74;
 
         fn hz_to_mel(f: f64) -> f64 {
-            if f < MIN_LOG_HZ { f / F_SP } else { MIN_LOG_MEL + (f / MIN_LOG_HZ).ln() / LOG_STEP }
+            if f < MIN_LOG_HZ {
+                f / F_SP
+            } else {
+                MIN_LOG_MEL + (f / MIN_LOG_HZ).ln() / LOG_STEP
+            }
         }
         fn mel_to_hz(m: f64) -> f64 {
-            if m < MIN_LOG_MEL { m * F_SP } else { MIN_LOG_HZ * ((m - MIN_LOG_MEL) * LOG_STEP).exp() }
+            if m < MIN_LOG_MEL {
+                m * F_SP
+            } else {
+                MIN_LOG_HZ * ((m - MIN_LOG_MEL) * LOG_STEP).exp()
+            }
         }
 
         let n_bins = n_fft / 2 + 1;
-        let fft_freqs: Vec<f64> = (0..n_bins).map(|k| k as f64 * sr as f64 / n_fft as f64).collect();
+        let fft_freqs: Vec<f64> = (0..n_bins)
+            .map(|k| k as f64 * sr as f64 / n_fft as f64)
+            .collect();
 
         let mel_min = hz_to_mel(fmin);
         let mel_max = hz_to_mel(fmax);
@@ -532,7 +547,11 @@ impl Model {
             let f_center = hz_points[m + 1];
             let f_right = hz_points[m + 2];
             // Slaney area-normalization: 2 / bandwidth
-            let enorm = if f_right > f_left { 2.0 / (f_right - f_left) } else { 0.0 };
+            let enorm = if f_right > f_left {
+                2.0 / (f_right - f_left)
+            } else {
+                0.0
+            };
             for k in 0..n_bins {
                 let f = fft_freqs[k];
                 let val = if f >= f_left && f <= f_center && f_center > f_left {
@@ -556,10 +575,29 @@ impl Model {
         let raw_sr = spec.sample_rate;
 
         let samples_f32: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-            (SampleFormat::Float, 32) => reader.samples::<f32>().map(|s| s.map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 16) => reader.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 32) => reader.samples::<i32>().map(|s| s.map(|v| v as f32 / 2147483648.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            _ => anyhow::bail!("Unsupported WAV format: {:?} {}bit", spec.sample_format, spec.bits_per_sample),
+            (SampleFormat::Float, 32) => reader
+                .samples::<f32>()
+                .map(|s| s.map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<Vec<_>>>()?,
+            (SampleFormat::Int, 16) => reader
+                .samples::<i16>()
+                .map(|s| {
+                    s.map(|v| v as f32 / 32768.0)
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            (SampleFormat::Int, 32) => reader
+                .samples::<i32>()
+                .map(|s| {
+                    s.map(|v| v as f32 / 2147483648.0)
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => anyhow::bail!(
+                "Unsupported WAV format: {:?} {}bit",
+                spec.sample_format,
+                spec.bits_per_sample
+            ),
         };
 
         // Mix down to mono if stereo
@@ -567,7 +605,10 @@ impl Model {
             samples_f32
         } else {
             let ch = spec.channels as usize;
-            samples_f32.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
+            samples_f32
+                .chunks(ch)
+                .map(|c| c.iter().sum::<f32>() / ch as f32)
+                .collect()
         };
 
         // Resample if needed (linear interpolation)
@@ -590,14 +631,8 @@ impl Model {
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
         };
-        let mut resampler = Async::<f32>::new_sinc(
-            ratio,
-            1.0,
-            &params,
-            chunk_size,
-            1,
-            FixedAsync::Input,
-        )?;
+        let mut resampler =
+            Async::<f32>::new_sinc(ratio, 1.0, &params, chunk_size, 1, FixedAsync::Input)?;
 
         let mut output = Vec::new();
         let mut pos = 0usize;
@@ -665,8 +700,9 @@ impl Model {
         //    Speaker encoder runs in F32 for precision (matching vendor).
         //    The embedding is later cast to model dtype in build_voice_clone_prefill.
         let spk_embed = {
-            let enc = self.inner.speaker_encoder.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Speaker encoder not loaded (base model required)"))?;
+            let enc = self.inner.speaker_encoder.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Speaker encoder not loaded (base model required)")
+            })?;
             let mels = Self::compute_mel_spectrogram(&ref_samples_spk, &self.device, DType::F32)?;
             let embed = enc.forward(&mels)?.squeeze(0)?; // [enc_dim], F32
             if Self::tts_debug_enabled() {
@@ -674,7 +710,11 @@ impl Model {
                 eprintln!(
                     "[CRANE_TTS_DEBUG] speaker_embed: dtype={:?}, shape={:?}, norm={:.4}, \
                      mel_shape={:?}, ref_samples={}",
-                    embed.dtype(), embed.dims(), norm, mels.dims(), ref_samples_spk.len(),
+                    embed.dtype(),
+                    embed.dims(),
+                    norm,
+                    mels.dims(),
+                    ref_samples_spk.len(),
                 );
             }
             embed
@@ -683,18 +723,21 @@ impl Model {
         // 4. Encode reference audio to codec codes using speech tokenizer encoder
         //    Load reference audio at codec SR (24kHz) — same SR, reuse ref_samples_spk
         let ref_codes = {
-            let speech_dec = self.speech_decoder.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Speech tokenizer not loaded; cannot encode reference audio"))?;
+            let speech_dec = self.speech_decoder.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Speech tokenizer not loaded; cannot encode reference audio")
+            })?;
             match speech_dec {
                 SpeechDecoderBackend::Native(native) => {
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
                     let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
-                        .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
+                        .unsqueeze(0)?
+                        .unsqueeze(0)?; // [1, 1, N]
                     let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
                     if Self::tts_debug_enabled() {
                         eprintln!(
                             "[CRANE_TTS_DEBUG] ref_codes: shape={:?}, dtype={:?}",
-                            codes.dims(), codes.dtype(),
+                            codes.dims(),
+                            codes.dtype(),
                         );
                         if let Ok(v) = codes.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
                             if !v.is_empty() {
@@ -717,7 +760,9 @@ impl Model {
                 }
                 #[cfg(feature = "onnx")]
                 SpeechDecoderBackend::Onnx(_) => {
-                    anyhow::bail!("Voice-clone requires native speech tokenizer (ONNX encoder not supported)")
+                    anyhow::bail!(
+                        "Voice-clone requires native speech tokenizer (ONNX encoder not supported)"
+                    )
                 }
             }
         };
@@ -744,7 +789,9 @@ impl Model {
             anyhow::bail!("No speech codes generated");
         }
 
-        let speech_decoder = self.speech_decoder.as_ref()
+        let speech_decoder = self
+            .speech_decoder
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Speech tokenizer decoder not loaded"))?;
 
         // 7. Prepend ref_codes to generated codes, decode, then trim ref portion.
@@ -757,14 +804,20 @@ impl Model {
         if Self::tts_debug_enabled() {
             eprintln!(
                 "[CRANE_TTS_DEBUG] voice_clone decode: generated={}, prepend_ref={}",
-                new_codes.len(), ref_t,
+                new_codes.len(),
+                ref_t,
             );
         }
 
         // Build combined codes: [ref_codes; new_codes] → [total_T, num_groups]
-        let ref_flat: Vec<i64> = ref_codes.to_dtype(DType::I64)?.to_vec2::<i64>()?
-            .into_iter().flatten().collect();
-        let new_flat: Vec<i64> = new_codes.iter()
+        let ref_flat: Vec<i64> = ref_codes
+            .to_dtype(DType::I64)?
+            .to_vec2::<i64>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let new_flat: Vec<i64> = new_codes
+            .iter()
             .flat_map(|frame| frame.iter().map(|&c| self.normalize_codec_id(c) as i64))
             .collect();
         let total_t = ref_t + new_codes.len();
@@ -798,7 +851,8 @@ impl Model {
         let ref_samples = ref_audio.dim(2)?;
         let mut cut = ref_samples.min(total_samples.saturating_sub(1));
         if cut == 0 {
-            let proportional = (ref_t as f64 / total_t.max(1) as f64 * total_samples as f64) as usize;
+            let proportional =
+                (ref_t as f64 / total_t.max(1) as f64 * total_samples as f64) as usize;
             cut = proportional.min(total_samples.saturating_sub(1));
         }
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
@@ -821,15 +875,24 @@ impl Model {
         output_path: &str,
     ) -> Result<String> {
         let (audio, sr) = self.generate_voice_clone(
-            text, language, ref_audio_path, ref_text,
-            max_new_tokens, temperature, top_p, repetition_penalty,
+            text,
+            language,
+            ref_audio_path,
+            ref_text,
+            max_new_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
         )?;
         Self::save_wav(&audio, output_path, sr)
     }
 
     fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
         let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
+        let scaled = audio
+            .affine(32767.0, 0.0)?
+            .clamp(-32768.0, 32767.0)?
+            .round()?;
         let audio_i64 = scaled.to_dtype(DType::I64)?;
         let spec = WavSpec {
             channels: 1,

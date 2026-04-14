@@ -46,7 +46,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -106,9 +106,7 @@ impl MemoryConfig {
     }
 
     fn parse_text_prefill_token_limit_env(raw: Option<String>) -> Option<usize> {
-        let Some(raw) = raw else {
-            return None;
-        };
+        let raw = raw?;
 
         let raw = raw.trim();
         if raw.is_empty() || raw == "0" {

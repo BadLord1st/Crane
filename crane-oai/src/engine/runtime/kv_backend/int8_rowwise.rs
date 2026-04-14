@@ -95,7 +95,7 @@ impl Int8RowwiseKvBackend {
         if row_width == 0 {
             bail!("int8_rowwise_kv row width must be > 0");
         }
-        if values.len() % row_width != 0 {
+        if !values.len().is_multiple_of(row_width) {
             bail!(
                 "int8_rowwise_kv rowwise quantization requires element_count={} to be divisible by row_width={}",
                 values.len(),
@@ -132,7 +132,7 @@ impl Int8RowwiseKvBackend {
         if row_width == 0 {
             bail!("int8_rowwise_kv row width must be > 0");
         }
-        if bytes.len() % row_width != 0 {
+        if !bytes.len().is_multiple_of(row_width) {
             bail!(
                 "int8_rowwise_kv payload element_count={} is not divisible by row_width={}",
                 bytes.len(),
@@ -187,7 +187,7 @@ impl Int8RowwiseKvBackend {
         Ok((KvEncodedPayloadEncoding::Int8RowwiseKvV1, bytes))
     }
 
-    fn parse_legacy_payload<'a>(bytes: &'a [u8]) -> Result<(f32, f32, &'a [u8], &'a [u8])> {
+    fn parse_legacy_payload(bytes: &[u8]) -> Result<(f32, f32, &[u8], &[u8])> {
         if bytes.len() < Self::LEGACY_HEADER_LEN {
             bail!(
                 "TurboQuant payload too short: got {} bytes, need at least {}",
@@ -258,7 +258,7 @@ impl Int8RowwiseKvBackend {
         if row_width == 0 {
             bail!("int8_rowwise_kv row width must be > 0");
         }
-        if element_count % row_width != 0 {
+        if !element_count.is_multiple_of(row_width) {
             bail!(
                 "int8_rowwise_kv element_count={} is not divisible by row_width={}",
                 element_count,
@@ -268,9 +268,9 @@ impl Int8RowwiseKvBackend {
         Ok(element_count / row_width)
     }
 
-    pub(crate) fn parse_rowwise_payload<'a>(
-        bytes: &'a [u8],
-    ) -> Result<(Vec<f32>, usize, Vec<f32>, usize, &'a [u8], &'a [u8])> {
+    pub(crate) fn parse_rowwise_payload(
+        bytes: &[u8],
+    ) -> Result<(Vec<f32>, usize, Vec<f32>, usize, &[u8], &[u8])> {
         if bytes.len() < Self::ROWWISE_HEADER_LEN {
             bail!(
                 "int8_rowwise_kv payload too short: got {} bytes, need at least {}",

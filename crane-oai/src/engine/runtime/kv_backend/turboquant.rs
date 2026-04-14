@@ -76,7 +76,7 @@ impl TurboQuantBackend {
     }
 
     fn rotate_row_pairs(values: &[f32]) -> Result<Vec<f32>> {
-        if values.len() % 2 != 0 {
+        if !values.len().is_multiple_of(2) {
             bail!(
                 "turboquant rotated K path requires even row width, got {}",
                 values.len()
@@ -377,7 +377,7 @@ impl TurboQuantBackend {
         TURBOQUANT_VALUE_GROUP_WIDTH_CANDIDATES
             .iter()
             .copied()
-            .find(|candidate| row_width >= *candidate && row_width % *candidate == 0)
+            .find(|candidate| row_width >= *candidate && row_width.is_multiple_of(*candidate))
     }
 
     fn quantize_grouped_values(
@@ -388,14 +388,14 @@ impl TurboQuantBackend {
         if group_width == 0 {
             bail!("turboquant grouped V group width must be > 0");
         }
-        if row_width == 0 || row_width % group_width != 0 {
+        if row_width == 0 || !row_width.is_multiple_of(group_width) {
             bail!(
                 "turboquant grouped V requires row_width={} to be divisible by group_width={}",
                 row_width,
                 group_width
             );
         }
-        if values.len() % row_width != 0 {
+        if !values.len().is_multiple_of(row_width) {
             bail!(
                 "turboquant grouped V requires element_count={} to be divisible by row_width={}",
                 values.len(),
@@ -746,7 +746,7 @@ impl KvCacheBackend for TurboQuantBackend {
             value_shape: value_shape.clone(),
             dtype,
             payload: KvLayerPayload::TurboQuant {
-                key: self.encode_key_payload(&key, &key_shape)?,
+                key: Box::new(self.encode_key_payload(&key, &key_shape)?),
                 value: self.encode_value_payload(&value, &value_shape)?,
             },
         }))

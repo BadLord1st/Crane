@@ -208,7 +208,7 @@ fn turboquant_k_payload_falls_back_to_dense_only_when_rotated_codebook_is_unsupp
 fn turboquant_weighted_value_prefix_consumes_grouped_v_payload() {
     let backend = TurboQuantBackend;
     let key = Tensor::zeros((1, 1, 2, 8), DType::F32, &Device::Cpu).unwrap();
-    let value_rows = vec![
+    let value_rows = [
         vec![0.1_f32, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, -0.4],
         vec![0.5_f32, 0.6, 0.7, 0.8, -0.5, -0.6, -0.7, -0.8],
     ];
@@ -229,7 +229,7 @@ fn turboquant_weighted_value_prefix_consumes_grouped_v_payload() {
         .to_vec1::<f32>()
         .unwrap();
 
-    let expected = vec![
+    let expected = [
         value_rows[0]
             .iter()
             .zip(value_rows[1].iter())
@@ -480,7 +480,7 @@ fn turboquant_weighted_value_prefix_supports_multi_token_decode_queries() {
 fn turboquant_weighted_value_prefix_supports_multi_token_decode_queries_single_kv_head() {
     let backend = TurboQuantBackend;
     let key = Tensor::zeros((1, 1, 2, 8), DType::F32, &Device::Cpu).unwrap();
-    let value_rows = vec![
+    let value_rows = [
         vec![0.1_f32, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, -0.4],
         vec![0.5_f32, 0.6, 0.7, 0.8, -0.5, -0.6, -0.7, -0.8],
     ];
@@ -505,7 +505,7 @@ fn turboquant_weighted_value_prefix_supports_multi_token_decode_queries_single_k
         .to_vec1::<f32>()
         .unwrap();
 
-    let expected = vec![
+    let expected = [
         value_rows[0]
             .iter()
             .zip(value_rows[1].iter())

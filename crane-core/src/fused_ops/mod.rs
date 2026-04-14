@@ -44,14 +44,10 @@ mod fallback {
             .collect();
         let kth = k.saturating_sub(1);
         pairs.select_nth_unstable_by(kth, |a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Greater)
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Greater)
         });
         pairs.truncate(k);
-        pairs.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Greater)
-        });
+        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Greater));
         let out: Vec<u32> = pairs.into_iter().map(|(_, i)| i).collect();
         Tensor::new(out.as_slice(), logits.device())
     }

@@ -12,3 +12,6 @@ T-0001	2026-04-13T00:00:00Z	deploy	1stbadwolf/crane@sha256:5dab0c85481789ce64198
 T-0002	2026-04-13T00:00:00Z	health	GET /health	200 OK after final rollout
 T-0002	2026-04-13T00:00:00Z	api	POST /v1/chat/completions	200 OK, returned assistant content for Gemma4 on CUDA
 T-0002	2026-04-13T00:00:00Z	log	kubectl logs ai-crane current pod	No `gpu top-k failed` / `CUDA_ERROR_INVALID_VALUE` matches after final top-k fix
+T-0002	2026-04-13T00:00:00Z	rollback	kubectl set image deployment/gemma-4-26b-a4b-it-crane -> sha256:ce2f0deaaab340eeb8e03190c8bda934c78c43c938bb06135124322f7305e49e	Rolled back broken attention optimization after live decode shape mismatch
+T-0002	2026-04-13T00:00:00Z	kb	docs/agent/error-kb.md	Recorded grouped-KV decode regression and rollback guidance
+T-0001	2026-04-14T00:00:00Z	parity	gpu parity pod tq-parity-run	Real PVC checkpoint TurboQuant parity FAILED before mixed-restore fix: prefill matched, decode step0 matched, decode step1 diverged dense=101 vs turbo=236772, enabled_layers=5/30

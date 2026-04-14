@@ -112,26 +112,26 @@ pub async fn speech(
 
     // Wait for TTS result
     match rx.await {
-        Ok(Ok(result)) => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, result.content_type)
-                .header(
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", result.file_name),
+        Ok(Ok(result)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, result.content_type)
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", result.file_name),
+            )
+            .body(axum::body::Body::from(result.audio_bytes))
+            .unwrap_or_else(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to build response",
                 )
-                .body(axum::body::Body::from(result.audio_bytes))
-                .unwrap_or_else(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to build response",
-                    )
-                        .into_response()
-                })
-        }
+                    .into_response()
+            }),
         Ok(Err(err)) => {
-            let (status, json) =
-                make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("TTS generation failed: {err}"));
+            let (status, json) = make_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("TTS generation failed: {err}"),
+            );
             (status, json).into_response()
         }
         Err(_) => {

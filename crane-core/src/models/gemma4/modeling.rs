@@ -14,6 +14,7 @@ pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
         query_states: &Tensor,
         num_kv_heads: usize,
         num_kv_groups: usize,
+        live_kv_len: usize,
     ) -> candle_core::Result<Option<Tensor>>;
 
     fn value_prefix(
@@ -21,6 +22,7 @@ pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
         layer_idx: usize,
         target_device: &Device,
         target_dtype: DType,
+        live_kv_len: usize,
     ) -> candle_core::Result<Option<Tensor>>;
 
     fn weighted_value_prefix(
@@ -31,6 +33,7 @@ pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
         num_kv_groups: usize,
         target_device: &Device,
         target_dtype: DType,
+        live_kv_len: usize,
     ) -> candle_core::Result<Option<Tensor>> {
         let _ = (
             layer_idx,
@@ -39,6 +42,7 @@ pub trait DecodePrefixKvSource: Send + Sync + std::fmt::Debug {
             num_kv_groups,
             target_device,
             target_dtype,
+            live_kv_len,
         );
         Ok(None)
     }
@@ -737,7 +741,7 @@ impl Attention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(usize, &Tensor, &Tensor)>,
         decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -784,15 +788,17 @@ impl Attention {
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states, produced_kv) = if let Some((k, v)) = shared_kv {
-            (k.clone(), v.clone(), None)
-        } else {
-            let (k, v) = match &mut self.kv_cache {
-                KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
-                KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+        let (key_states, value_states, produced_kv, prefix_layer_idx) =
+            if let Some((shared_layer_idx, k, v)) = shared_kv {
+                (k.clone(), v.clone(), None, shared_layer_idx)
+            } else {
+                let (k, v) = match &mut self.kv_cache {
+                    KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
+                    KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+                };
+                (k.clone(), v.clone(), Some((k, v)), self.layer_idx)
             };
-            (k.clone(), v.clone(), Some((k, v)))
-        };
+        let live_kv_len = key_states.dim(2)?;
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
@@ -801,13 +807,14 @@ impl Attention {
         let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
         let mut prefix_scores_and_source = None;
-        if b_sz == 1 && q_len > 0 && shared_kv.is_none() {
+        if b_sz == 1 && q_len > 0 {
             if let Some(prefix_kv) = decode_prefix_kv {
                 if let Some(prefix_scores) = prefix_kv.score_prefix_keys(
-                    self.layer_idx,
+                    prefix_layer_idx,
                     &query_states,
                     self.num_kv_heads,
                     self.num_kv_groups,
+                    live_kv_len,
                 )? {
                     let prefix_scores = prefix_scores
                         .to_device(query_states.device())?
@@ -832,16 +839,17 @@ impl Attention {
             let local_output = local_probs.matmul(&value_states)?;
 
             if let Some(prefix_output) = prefix_kv.weighted_value_prefix(
-                self.layer_idx,
+                prefix_layer_idx,
                 &prefix_probs,
                 self.num_kv_heads,
                 self.num_kv_groups,
                 xs.device(),
                 xs.dtype(),
+                live_kv_len,
             )? {
                 local_output.broadcast_add(&prefix_output)?
             } else if let Some(prefix_values) =
-                prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?
+                prefix_kv.value_prefix(prefix_layer_idx, xs.device(), xs.dtype(), live_kv_len)?
             {
                 let prefix_values = repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
                 let prefix_output = prefix_probs.matmul(&prefix_values)?;
@@ -865,7 +873,7 @@ impl Attention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         positions: &[usize],
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(usize, &Tensor, &Tensor)>,
         decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -913,15 +921,17 @@ impl Attention {
             positions,
         )?;
 
-        let (key_states, value_states, produced_kv) = if let Some((k, v)) = shared_kv {
-            (k.clone(), v.clone(), None)
-        } else {
-            let (k, v) = match &mut self.kv_cache {
-                KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
-                KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+        let (key_states, value_states, produced_kv, prefix_layer_idx) =
+            if let Some((shared_layer_idx, k, v)) = shared_kv {
+                (k.clone(), v.clone(), None, shared_layer_idx)
+            } else {
+                let (k, v) = match &mut self.kv_cache {
+                    KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
+                    KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+                };
+                (k.clone(), v.clone(), Some((k, v)), self.layer_idx)
             };
-            (k.clone(), v.clone(), Some((k, v)))
-        };
+        let live_kv_len = key_states.dim(2)?;
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
@@ -929,13 +939,14 @@ impl Attention {
         let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
         let mut prefix_scores_and_source = None;
-        if b_sz == 1 && q_len > 0 && shared_kv.is_none() {
+        if b_sz == 1 && q_len > 0 {
             if let Some(prefix_kv) = decode_prefix_kv {
                 if let Some(prefix_scores) = prefix_kv.score_prefix_keys(
-                    self.layer_idx,
+                    prefix_layer_idx,
                     &query_states,
                     self.num_kv_heads,
                     self.num_kv_groups,
+                    live_kv_len,
                 )? {
                     let prefix_scores = prefix_scores
                         .to_device(query_states.device())?
@@ -960,16 +971,17 @@ impl Attention {
             let local_output = local_probs.matmul(&value_states)?;
 
             if let Some(prefix_output) = prefix_kv.weighted_value_prefix(
-                self.layer_idx,
+                prefix_layer_idx,
                 &prefix_probs,
                 self.num_kv_heads,
                 self.num_kv_groups,
                 xs.device(),
                 xs.dtype(),
+                live_kv_len,
             )? {
                 local_output.broadcast_add(&prefix_output)?
             } else if let Some(prefix_values) =
-                prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?
+                prefix_kv.value_prefix(prefix_layer_idx, xs.device(), xs.dtype(), live_kv_len)?
             {
                 let prefix_values = repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
                 let prefix_output = prefix_probs.matmul(&prefix_values)?;
@@ -1058,6 +1070,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         weighted_calls: Arc<AtomicUsize>,
         value_calls: Arc<AtomicUsize>,
+        last_layer_idx: Arc<AtomicUsize>,
         scores: Tensor,
         values: Tensor,
     }
@@ -1065,35 +1078,41 @@ mod tests {
     impl DecodePrefixKvSource for DummyDecodePrefixKvSource {
         fn score_prefix_keys(
             &self,
-            _layer_idx: usize,
+            layer_idx: usize,
             _query_states: &Tensor,
             _num_kv_heads: usize,
             _num_kv_groups: usize,
+            _live_kv_len: usize,
         ) -> candle_core::Result<Option<Tensor>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_layer_idx.store(layer_idx, Ordering::SeqCst);
             Ok(Some(self.scores.clone()))
         }
 
         fn value_prefix(
             &self,
-            _layer_idx: usize,
+            layer_idx: usize,
             _target_device: &Device,
             _target_dtype: DType,
+            _live_kv_len: usize,
         ) -> candle_core::Result<Option<Tensor>> {
             self.value_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_layer_idx.store(layer_idx, Ordering::SeqCst);
             Ok(Some(self.values.clone()))
         }
 
         fn weighted_value_prefix(
             &self,
-            _layer_idx: usize,
+            layer_idx: usize,
             _attn_weights: &Tensor,
             _num_kv_heads: usize,
             _num_kv_groups: usize,
             _target_device: &Device,
             _target_dtype: DType,
+            _live_kv_len: usize,
         ) -> candle_core::Result<Option<Tensor>> {
             self.weighted_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_layer_idx.store(layer_idx, Ordering::SeqCst);
             Ok(Some(self.values.clone()))
         }
     }
@@ -1372,10 +1391,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let weighted_calls = Arc::new(AtomicUsize::new(0));
         let value_calls = Arc::new(AtomicUsize::new(0));
+        let last_layer_idx = Arc::new(AtomicUsize::new(usize::MAX));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
             weighted_calls: weighted_calls.clone(),
             value_calls: value_calls.clone(),
+            last_layer_idx: last_layer_idx.clone(),
             scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
                 .expect("prefix scores"),
             values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
@@ -1411,10 +1432,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let weighted_calls = Arc::new(AtomicUsize::new(0));
         let value_calls = Arc::new(AtomicUsize::new(0));
+        let last_layer_idx = Arc::new(AtomicUsize::new(usize::MAX));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
             weighted_calls: weighted_calls.clone(),
             value_calls: value_calls.clone(),
+            last_layer_idx: last_layer_idx.clone(),
             scores: Tensor::from_vec(
                 vec![100f32, 0., 100., 0., 100f32, 0., 100., 0.],
                 (1, 2, 2, 2),
@@ -1444,6 +1467,44 @@ mod tests {
     }
 
     #[test]
+    fn attention_decode_prefix_uses_shared_kv_source_layer_idx() {
+        let cfg = test_config(false);
+        let vb = VarBuilder::from_tensors(
+            prefix_path_tensor_map().expect("tensor map"),
+            DType::F32,
+            &Device::Cpu,
+        );
+        let mut attention = Attention::new(&cfg, 1, vb).expect("attention should build");
+        let xs =
+            Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &Device::Cpu).expect("input tensor");
+        let shared_k = Tensor::zeros((1, 1, 1, 2), DType::F32, &Device::Cpu).expect("shared k");
+        let shared_v = Tensor::zeros((1, 1, 1, 2), DType::F32, &Device::Cpu).expect("shared v");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let weighted_calls = Arc::new(AtomicUsize::new(0));
+        let value_calls = Arc::new(AtomicUsize::new(0));
+        let last_layer_idx = Arc::new(AtomicUsize::new(usize::MAX));
+        let prefix = DummyDecodePrefixKvSource {
+            calls: calls.clone(),
+            weighted_calls: weighted_calls.clone(),
+            value_calls: value_calls.clone(),
+            last_layer_idx: last_layer_idx.clone(),
+            scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
+                .expect("prefix scores"),
+            values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
+                .expect("prefix values"),
+        };
+
+        let _ = attention
+            .forward(&xs, None, 0, Some((0, &shared_k, &shared_v)), Some(&prefix))
+            .expect("shared-kv decode should use source-layer prefix cache");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(weighted_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(value_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(last_layer_idx.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn attention_decode_prefix_falls_back_for_batch_decode() {
         let cfg = test_config(false);
         let vb = VarBuilder::from_tensors(
@@ -1457,10 +1518,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let weighted_calls = Arc::new(AtomicUsize::new(0));
         let value_calls = Arc::new(AtomicUsize::new(0));
+        let last_layer_idx = Arc::new(AtomicUsize::new(usize::MAX));
         let prefix = DummyDecodePrefixKvSource {
             calls: calls.clone(),
             weighted_calls: weighted_calls.clone(),
             value_calls: value_calls.clone(),
+            last_layer_idx: last_layer_idx.clone(),
             scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
                 .expect("prefix scores"),
             values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
@@ -1619,7 +1682,7 @@ impl DecoderLayer {
         per_layer_input: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(usize, &Tensor, &Tensor)>,
         decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let perf_enabled = gemma4_perf_enabled();
@@ -1724,7 +1787,7 @@ impl DecoderLayer {
         per_layer_input: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         positions: &[usize],
-        shared_kv: Option<(&Tensor, &Tensor)>,
+        shared_kv: Option<(usize, &Tensor, &Tensor)>,
         decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
     ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let residual = xs;
@@ -2033,7 +2096,7 @@ impl Gemma4TextModel {
             };
 
             let shared_kv = self.shared_kv_source[layer_idx]
-                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (k, v)));
+                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (src, k, v)));
 
             let per_layer_input = if let Some(ref all_inputs) = per_layer_inputs {
                 Some(all_inputs.narrow(2, layer_idx, 1)?.squeeze(2)?)
@@ -2109,6 +2172,10 @@ impl Gemma4TextModel {
 
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn shared_kv_source(&self, layer_idx: usize) -> Option<usize> {
+        self.shared_kv_source.get(layer_idx).copied().flatten()
     }
 
     /// Total bytes held by the model's KV caches (no GPU copies).
@@ -2224,7 +2291,7 @@ impl Gemma4TextModel {
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let shared_kv = self.shared_kv_source[layer_idx]
-                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (k, v)));
+                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (src, k, v)));
 
             let per_layer_input = if let Some(ref all_inputs) = per_layer_inputs {
                 Some(all_inputs.narrow(2, layer_idx, 1)?.squeeze(2)?)

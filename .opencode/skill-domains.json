@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "domains": {
+    "ai-research": {
+      "name": "ai-research",
+      "repo": "https://github.com/zechenzhangAGI/AI-research-SKILLs",
+      "ref": "main",
+      "subdir": "."
+    }
+  }
+}

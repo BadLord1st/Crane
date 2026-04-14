@@ -16,6 +16,8 @@ Last updated: 2026-04-13T00:00:00Z
 - Verify pod readiness and /health for ai-crane after model load completes
 
 ## Recent pulse (append-only)
+- 2026-04-14T00:00:00Z NOTE: Recorded real PVC checkpoint TurboQuant parity failure prior to mixed-restore drift fix: prefill ok, decode diverged at step 1 with enabled_layers=5/30
+- 2026-04-13T00:00:00Z NOTE: Attempted grouped-KV Gemma4 decode attention optimization; live decode failed with matmul shape mismatch and deployment was rolled back to previous working digest
 - 2026-04-13T00:00:00Z NOTE: Fixed Gemma4 router gather contiguity and rolled out updated image
 - 2026-04-13T00:00:00Z NOTE: Fixed Gemma4 router weight dtype and rolled out updated image
 - 2026-04-13T00:00:00Z NOTE: Fixed CUDA top-k launch budget and rolled out image sha256:5dab0c85481789ce64198a8c5a3e8cb21282811863cd290d17bca8b8e0302582
@@ -37,3 +39,5 @@ Last updated: 2026-04-13T00:00:00Z
 - Final rollout image: sha256:5dab0c85481789ce64198a8c5a3e8cb21282811863cd290d17bca8b8e0302582.
 - Final health check: 200 OK.
 - Final chat completion: 200 OK, Gemma4 responded successfully on CUDA.
+- Broken attention optimization was rolled back; cluster is back on working digest sha256:ce2f0deaaab340eeb8e03190c8bda934c78c43c938bb06135124322f7305e49e.
+- Real PVC checkpoint TurboQuant parity was recorded as failing before the mixed-restore drift fix (prefill and first decode step ok, divergence at decode step 1).

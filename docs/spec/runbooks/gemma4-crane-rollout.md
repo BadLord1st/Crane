@@ -52,8 +52,12 @@ Supported slice only:
 - restored prefix
 - `batch=1`
 - `q_len>=1`
-- all restored layers must be non-sliding / `full_attention`
-- no shared-KV broadening
+- restored layers may be `full_attention` or `sliding_attention`
+- sliding-window TurboQuant restore/decode is bounded to layers whose effective restored window still leaves at least `16` compressed-history tokens after preserving the exact recent buffer
+- shared-KV broadening is bounded to explicit owner/source mappings already encoded by the Gemma4 config:
+  - only the source layer owns stored/exported KV
+  - shared layers remain non-owning on extract and resolve restored-prefix lookup through their configured source layer
+  - unsupported shared-source cases stay on explicit dense fallback
 - hybrid history policy only:
   - compressed TurboQuant history is used only for sufficiently old tokens
   - the newest `8` restored tokens stay exact/dense in the live model KV buffer
@@ -63,15 +67,16 @@ Supported slice only:
 Restore boundary:
 - if **every** restored layer is in the supported narrow slice, TurboQuant decode-prefix may stay enabled for those layers
 - when enabled, restore is now hybrid rather than fully prefix-compressed: old history stays in the TurboQuant decode-prefix cache and the newest `8` restored tokens stay dense in the live KV cache
-- if **any** restored layer is unsupported (for example sliding-window or shared-KV), the adapter now performs a **semantic-preserving dense restore fallback for all layers** during restore/decode
+- sliding-window layers now keep an explicit windowed prefix budget during restore/decode: only the tail of the compressed prefix that still fits inside the current sliding window contributes scores/values, and that budget shrinks to zero as dense/live KV fills the window
+- if **any** restored layer is unsupported (for example a malformed shared-KV source mapping, or a sliding-window layer whose effective restored window is too short), the adapter now performs a **semantic-preserving dense restore fallback for all layers** during restore/decode
 - if restored history is too short to leave at least `16` compressed-history tokens after carving out the exact recent buffer, the adapter performs an explicit dense fallback for that restore rather than pretending TurboQuant is active
-- this is intentionally **not** sliding/shared-KV TurboQuant support; it is a bounded parity fallback
+- this is intentionally **not** universal shared-KV TurboQuant support, and it is **not** TurboQuant sliding batch decode support; it is a bounded restored-prefix parity slice with explicit shared-layer ownership rules
 
 Current adapter batch-decode broadening status:
 - `turboquant` runtime batch decode is now supported only for `q_len=1` batched decode over restored KV with mixed positions and padding masks
 - the supported batch path imports stored TurboQuant KV into dense batched model state for the decode step, then re-exports TurboQuant envelopes on extraction
 - `bf16_dense` remains unchanged in this slice
-- sliding-window and shared-KV Gemma4 layers remain explicitly out of scope for batch decode
+- shared-KV and sliding-window Gemma4 layers remain explicitly out of scope for batch decode in this slice
 
 Command:
 
@@ -98,8 +103,8 @@ Notes:
   - `event=gemma4_turboquant_restore_layer`
   - `event=gemma4_turboquant_decode_prefix_fallback`
 - Supported decision categories are bounded and explicit:
-  - `decision=turboquant_narrow_path` with `reason=supported_narrow_path` for `batch=1`, `q_len>=1`, all-layer-supported restored-prefix decode with hybrid history (`compressed_history_tokens>=16` and `exact_recent_tokens=8`)
-  - `decision=dense_fallback` with reasons such as `history_too_short`, `mixed_layer_restore_unsupported`, `shared_kv_unsupported`, `sliding_window_unsupported`, `backend_no_compressed_k_scores`, `batch_size_unsupported`, `query_len_unsupported`, `kv_groups_unsupported`, or `head_layout_unsupported`
+  - `decision=turboquant_narrow_path` with `reason=supported_narrow_path` for `batch=1`, `q_len>=1`, all-layer-supported restored-prefix decode with hybrid history (`compressed_history_tokens>=16` and `exact_recent_tokens=8`), including bounded sliding-window layers whose active compressed-prefix tail still fits the current window and bounded shared-KV layers that resolve to an explicit source owner
+  - `decision=dense_fallback` with reasons such as `history_too_short`, `mixed_layer_restore_unsupported`, `shared_kv_source_missing`, `shared_kv_unsupported`, `sliding_window_unsupported`, `backend_no_compressed_k_scores`, `batch_size_unsupported`, `query_len_unsupported`, `kv_groups_unsupported`, or `head_layout_unsupported`
 
 Pass condition:
 - the test exits successfully
@@ -112,8 +117,9 @@ Failure interpretation:
 - if the checkpoint path is inaccessible, the test fails immediately with a path/configuration message
 - if `first_divergence_step` is not `None`, treat that step as the start of open-loop parity drift on the currently supported narrow path or its dense-fallback restore boundary
 - if top-1 diverges on any step, treat that as real-checkpoint parity drift on the currently supported path/boundary
-- if enabled decode-prefix layer count is `0/N` on a mixed sliding/shared-KV model, that is now expected bounded behavior rather than a sliding/shared-KV support claim
+- if enabled decode-prefix owner count is lower than total layer count on a shared-KV model, that is expected bounded behavior: only owner layers hold prefix caches, while supported shared layers reuse those owner caches through explicit source mapping
 - if hybrid restore is enabled, only the sufficiently old prefix is TurboQuant-compressed; the newest `8` restored tokens remain dense/exact by policy in this slice
+- for supported sliding-window layers, the active compressed-prefix tail should monotonically shrink as decode grows the live window; once the live dense KV fully occupies the window, decode-prefix usage for that layer should naturally fall to zero without reintroducing stale prefix attention
 
 ## Rollback
 

@@ -221,13 +221,14 @@ impl RotaryEmbedding {
         // Pre-compute full cos/sin tables: [max_pos, dim/2]
         let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions
-            .unsqueeze(1)?
-            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
+        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
         let cos_table = freqs.cos()?.contiguous()?;
         let sin_table = freqs.sin()?.contiguous()?;
 
-        Ok(Self { cos_table, sin_table })
+        Ok(Self {
+            cos_table,
+            sin_table,
+        })
     }
 
     fn default_inv_freq(dim: usize, base: f64, device: &Device) -> Result<Tensor> {
@@ -351,8 +352,11 @@ impl Attention {
         // replaces three.  `narrow` splits are zero-copy views.
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
-            (&q_proj, &k_proj, &v_proj)
+        let qkv_proj = if let (
+            LinearLayer::Standard(ref q),
+            LinearLayer::Standard(ref k),
+            LinearLayer::Standard(ref v),
+        ) = (&q_proj, &k_proj, &v_proj)
         {
             let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
             let qkv_b = match (q.bias(), k.bias(), v.bias()) {
@@ -579,8 +583,7 @@ impl Attention {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g =
-                (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
 
             // K^T: [B, kv_heads, D, S] — just a view, no copy
             let k_t = k.transpose(2, 3)?;
@@ -654,9 +657,16 @@ impl Attention {
 /// Gate+up projection: either a merged [2*I, H] weight (Standard) or separate quantized projections.
 enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
-    Merged { gate_up_proj: Linear, intermediate_size: usize },
+    Merged {
+        gate_up_proj: Linear,
+        intermediate_size: usize,
+    },
     /// Separate quantized gate and up projections (GGUF).
-    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+    Separate {
+        gate_proj: LinearLayer,
+        up_proj: LinearLayer,
+        intermediate_size: usize,
+    },
 }
 
 struct Mlp {
@@ -693,7 +703,11 @@ impl Mlp {
         Ok(Self { gate_up, down_proj })
     }
 
-    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -710,7 +724,10 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match &self.gate_up {
-            MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
+            MlpGateUp::Merged {
+                gate_up_proj,
+                intermediate_size,
+            } => {
                 let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
                 #[cfg(feature = "cuda")]
@@ -730,7 +747,9 @@ impl Mlp {
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 self.down_proj.forward(&(gate * up)?)
             }
-            MlpGateUp::Separate { gate_proj, up_proj, .. } => {
+            MlpGateUp::Separate {
+                gate_proj, up_proj, ..
+            } => {
                 let gate = gate_proj.forward(x)?;
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 let up = up_proj.forward(x)?;
@@ -800,7 +819,8 @@ impl DecoderLayer {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
         let hidden_states =
-            self.self_attn.forward(&hidden_states, cos, sin, attention_mask, shared_kv)?;
+            self.self_attn
+                .forward(&hidden_states, cos, sin, attention_mask, shared_kv)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -1046,8 +1066,13 @@ impl HunYuanDenseV1 {
             } else {
                 None
             };
-            hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), shared_kv)?;
+            hidden_states = layer.forward(
+                &hidden_states,
+                &cos,
+                &sin,
+                attention_mask.as_ref(),
+                shared_kv,
+            )?;
 
             // After an anchor layer, save its KV cache for shared layers.
             if use_cla && cla_factor > 1 && i % cla_factor == 0 {
@@ -1082,10 +1107,8 @@ impl HunYuanDenseV1 {
                     .kv_cache
                     .as_ref()
                     .map(|(k, v)| {
-                        let k_bytes =
-                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes =
-                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
                         k_bytes + v_bytes
                     })
                     .unwrap_or(0)

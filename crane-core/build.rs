@@ -16,9 +16,7 @@ fn main() {
             .arg("-std=c++17")
             .arg("-O3");
 
-        let bindings = builder
-            .build_ptx()
-            .expect("Failed to compile CUDA kernels");
+        let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
         bindings
             .write(out_dir.join("crane_kernels_ptx.rs"))
             .expect("Failed to write PTX bindings");

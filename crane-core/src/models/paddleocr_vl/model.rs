@@ -250,7 +250,10 @@ impl PaddleOcrVL {
             &self.device,
         )?;
 
-        println!("Starting recognize! Input IDs shape: {:?}", input_ids.shape());
+        println!(
+            "Starting recognize! Input IDs shape: {:?}",
+            input_ids.shape()
+        );
 
         self.model.clear_kv_cache();
 

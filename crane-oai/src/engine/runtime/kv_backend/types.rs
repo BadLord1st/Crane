@@ -20,7 +20,7 @@ pub enum KvLayerPayload {
         bytes: Vec<u8>,
     },
     TurboQuant {
-        key: TurboQuantKeyPayload,
+        key: Box<TurboQuantKeyPayload>,
         value: TurboQuantValuePayload,
     },
 }

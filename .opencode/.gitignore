@@ -1,0 +1,5 @@
+handoff/
+node_modules/
+bun.lock
+package.json
+!handoff/README.md
