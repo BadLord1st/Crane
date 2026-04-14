@@ -267,6 +267,44 @@ impl RotaryEmbedding {
         let k_embed = (k.broadcast_mul(&cos_full)? + rotate_half(k)?.broadcast_mul(&sin_full)?)?;
         Ok((q_embed, k_embed))
     }
+
+    fn apply_rotary_emb_qkv_batch_positions(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &[usize],
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        if seq_len != 1 {
+            candle_core::bail!("Gemma4 batch decode rotary expects q_len=1, got q_len={seq_len}")
+        }
+        if positions.len() != b_sz {
+            candle_core::bail!(
+                "Gemma4 batch decode rotary expects positions.len() == batch, got positions_len={} batch={b_sz}",
+                positions.len()
+            )
+        }
+
+        let pos_ids: Vec<u32> = positions.iter().map(|&pos| pos as u32).collect();
+        let freqs = Tensor::new(pos_ids.as_slice(), q.device())?
+            .to_dtype(self.dtype)?
+            .reshape((b_sz, 1))?
+            .matmul(&self.inv_freq)?;
+        let sin = freqs.sin()?;
+        let cos = freqs.cos()?;
+        let target_dtype = q.dtype();
+        let cos_full = Tensor::cat(&[&cos, &cos], D::Minus1)?
+            .to_dtype(target_dtype)?
+            .unsqueeze(1)?
+            .unsqueeze(2)?;
+        let sin_full = Tensor::cat(&[&sin, &sin], D::Minus1)?
+            .to_dtype(target_dtype)?
+            .unsqueeze(1)?
+            .unsqueeze(2)?;
+        let q_embed = (q.broadcast_mul(&cos_full)? + rotate_half(q)?.broadcast_mul(&sin_full)?)?;
+        let k_embed = (k.broadcast_mul(&cos_full)? + rotate_half(k)?.broadcast_mul(&sin_full)?)?;
+        Ok((q_embed, k_embed))
+    }
 }
 
 fn rotate_half(x: &Tensor) -> candle_core::Result<Tensor> {
@@ -757,13 +795,141 @@ impl Attention {
         };
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let mut value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
         // Gemma4 text eager-attention path uses scaling=1.0.
         let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
         let mut prefix_scores_and_source = None;
-        if b_sz == 1 && q_len == 1 && shared_kv.is_none() {
+        if b_sz == 1 && q_len > 0 && shared_kv.is_none() {
+            if let Some(prefix_kv) = decode_prefix_kv {
+                if let Some(prefix_scores) = prefix_kv.score_prefix_keys(
+                    self.layer_idx,
+                    &query_states,
+                    self.num_kv_heads,
+                    self.num_kv_groups,
+                )? {
+                    let prefix_scores = prefix_scores
+                        .to_device(query_states.device())?
+                        .to_dtype(query_states.dtype())?;
+                    let prefix_len = prefix_scores.dim(D::Minus1)?;
+                    attn_weights = Tensor::cat(&[&prefix_scores, &attn_weights], D::Minus1)?;
+                    prefix_scores_and_source = Some((prefix_len, prefix_kv));
+                }
+            }
+        }
+
+        let attn_weights = match attention_mask {
+            None => attn_weights,
+            Some(mask) => attn_weights.broadcast_add(mask)?,
+        };
+        let attn_weights = softmax_last_dim_fallback(&attn_weights)?;
+        let attn_output = if let Some((prefix_len, prefix_kv)) = prefix_scores_and_source {
+            let total_len = attn_weights.dim(D::Minus1)?;
+            let local_len = total_len.saturating_sub(prefix_len);
+            let prefix_probs = attn_weights.narrow(D::Minus1, 0, prefix_len)?;
+            let local_probs = attn_weights.narrow(D::Minus1, prefix_len, local_len)?;
+            let local_output = local_probs.matmul(&value_states)?;
+
+            if let Some(prefix_output) = prefix_kv.weighted_value_prefix(
+                self.layer_idx,
+                &prefix_probs,
+                self.num_kv_heads,
+                self.num_kv_groups,
+                xs.device(),
+                xs.dtype(),
+            )? {
+                local_output.broadcast_add(&prefix_output)?
+            } else if let Some(prefix_values) =
+                prefix_kv.value_prefix(self.layer_idx, xs.device(), xs.dtype())?
+            {
+                let prefix_values = repeat_kv(prefix_values, self.num_kv_groups)?.contiguous()?;
+                let prefix_output = prefix_probs.matmul(&prefix_values)?;
+                local_output.broadcast_add(&prefix_output)?
+            } else {
+                local_output
+            }
+        } else {
+            attn_weights.matmul(&value_states)?
+        };
+
+        let out = attn_output
+            .transpose(1, 2)?
+            .reshape((b_sz, q_len, ()))?
+            .apply(&self.o_proj)?;
+        Ok((out, produced_kv))
+    }
+
+    fn forward_with_batch_positions(
+        &mut self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        positions: &[usize],
+        shared_kv: Option<(&Tensor, &Tensor)>,
+        decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
+        let value_states = match &self.v_proj {
+            Some(v_proj) => v_proj.forward(xs)?,
+            None if self.attention_k_eq_v => key_states.clone(),
+            None => {
+                candle_core::bail!("missing v_proj for Gemma4 attention without attention_k_eq_v")
+            }
+        };
+
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let mut value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let query_states = self.q_norm.forward(&query_states)?;
+        let key_states = self.k_norm.forward(&key_states)?;
+
+        {
+            let v_dtype = value_states.dtype();
+            let v_internal_dtype = match v_dtype {
+                DType::F16 | DType::BF16 => DType::F32,
+                d => d,
+            };
+            let h = value_states.dim(D::Minus1)?;
+            let v = value_states.to_dtype(v_internal_dtype)?;
+            let norm_v = (v.sqr()?.sum_keepdim(D::Minus1)? / h as f64)?;
+            value_states = v
+                .broadcast_div(&(norm_v + 1e-6)?.sqrt()?)?
+                .to_dtype(v_dtype)?;
+        }
+
+        let (query_states, key_states) = self.rotary_emb.apply_rotary_emb_qkv_batch_positions(
+            &query_states,
+            &key_states,
+            positions,
+        )?;
+
+        let (key_states, value_states, produced_kv) = if let Some((k, v)) = shared_kv {
+            (k.clone(), v.clone(), None)
+        } else {
+            let (k, v) = match &mut self.kv_cache {
+                KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
+                KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+            };
+            (k.clone(), v.clone(), Some((k, v)))
+        };
+
+        let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+
+        let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
+
+        let mut prefix_scores_and_source = None;
+        if b_sz == 1 && q_len > 0 && shared_kv.is_none() {
             if let Some(prefix_kv) = decode_prefix_kv {
                 if let Some(prefix_scores) = prefix_kv.score_prefix_keys(
                     self.layer_idx,
@@ -854,7 +1020,25 @@ impl Attention {
                 let _ = c.append(&k, &v);
             }
             KvCache::Rotating(c) => {
-                let _ = c.append(&k, &v);
+                // Rebuild rotating caches one decode position at a time so restore matches the
+                // live prefill state, including offset evolution for sliding-window layers.
+                let seq_len = match k.dim(2) {
+                    Ok(seq_len) => seq_len,
+                    Err(_) => return,
+                };
+                for pos in 0..seq_len {
+                    let k_step = match k.narrow(2, pos, 1) {
+                        Ok(step) => step,
+                        Err(_) => return,
+                    };
+                    let v_step = match v.narrow(2, pos, 1) {
+                        Ok(step) => step,
+                        Err(_) => return,
+                    };
+                    if c.append(&k_step, &v_step).is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1214,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_decode_prefix_falls_back_for_multi_token_queries() {
+    fn attention_decode_prefix_uses_prefix_scores_for_multi_token_queries() {
         let cfg = test_config(false);
         let vb = VarBuilder::from_tensors(
             prefix_path_tensor_map().expect("tensor map"),
@@ -1231,25 +1415,32 @@ mod tests {
             calls: calls.clone(),
             weighted_calls: weighted_calls.clone(),
             value_calls: value_calls.clone(),
-            scores: Tensor::from_vec(vec![100f32, 0., 100., 0.], (1, 2, 1, 2), &Device::Cpu)
-                .expect("prefix scores"),
-            values: Tensor::from_vec(vec![3f32, 4.], (1, 1, 1, 2), &Device::Cpu)
+            scores: Tensor::from_vec(
+                vec![100f32, 0., 100., 0., 100f32, 0., 100., 0.],
+                (1, 2, 2, 2),
+                &Device::Cpu,
+            )
+            .expect("prefix scores"),
+            values: Tensor::from_vec(vec![3f32, 4., 3f32, 4.], (1, 1, 2, 2), &Device::Cpu)
                 .expect("prefix values"),
         };
 
         let (output, _) = attention
             .forward(&xs, None, 0, None, Some(&prefix))
-            .expect("multi-token path should fall back safely");
+            .expect("multi-token path should use decode prefix");
         let output = output
             .to_dtype(DType::F32)
             .expect("output dtype")
             .to_vec3::<f32>()
             .expect("output vec");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(weighted_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(weighted_calls.load(Ordering::SeqCst), 1);
         assert_eq!(value_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(output, vec![vec![vec![0.0; 4], vec![0.0; 4]]]);
+        assert_eq!(
+            output,
+            vec![vec![vec![3.0, 4.0, 3.0, 4.0], vec![3.0, 4.0, 3.0, 4.0]]]
+        );
     }
 
     #[test]
@@ -1522,6 +1713,75 @@ impl DecoderLayer {
                 seqlen_offset,
                 "gemma4_decode_layer_perf",
             );
+        }
+
+        Ok((xs.broadcast_mul(&self.layer_scalar)?, produced_kv))
+    }
+
+    fn forward_with_batch_positions(
+        &mut self,
+        xs: &Tensor,
+        per_layer_input: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        positions: &[usize],
+        shared_kv: Option<(&Tensor, &Tensor)>,
+        decode_prefix_kv: Option<&dyn DecodePrefixKvSource>,
+    ) -> candle_core::Result<(Tensor, Option<(Tensor, Tensor)>)> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let (xs, produced_kv) = self.self_attn.forward_with_batch_positions(
+            &xs,
+            attention_mask,
+            positions,
+            shared_kv,
+            decode_prefix_kv,
+        )?;
+        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let xs = (xs + residual)?;
+
+        let residual = &xs;
+        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+        let mut xs = xs.apply(&self.mlp)?;
+
+        if let (Some(router), Some(experts), Some(pre_ff2), Some(post_ff1), Some(post_ff2)) = (
+            self.router.as_ref(),
+            self.experts.as_mut(),
+            self.pre_feedforward_layernorm_2.as_ref(),
+            self.post_feedforward_layernorm_1.as_ref(),
+            self.post_feedforward_layernorm_2.as_ref(),
+        ) {
+            let (b, s, h) = residual.dims3()?;
+            let residual_flat = residual.reshape((b * s, h))?;
+            let routes = router.route(&residual_flat)?;
+
+            let moe_in = residual_flat.apply(pre_ff2)?;
+            let moe_out = experts.forward(&moe_in, &routes)?;
+            let moe_out = moe_out.reshape((b, s, h))?.apply(post_ff2)?;
+
+            let mlp_out = xs.apply(post_ff1)?;
+            xs = (mlp_out + moe_out)?;
+        }
+
+        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        let mut xs = (residual + xs)?;
+
+        if let (
+            Some(per_layer_input_gate),
+            Some(per_layer_projection),
+            Some(post_per_layer_input_norm),
+            Some(per_layer_input),
+        ) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let residual = &xs;
+            let x_gate = xs.apply(per_layer_input_gate)?.apply(&self.act_fn)?;
+            let x_gate = x_gate.broadcast_mul(per_layer_input)?;
+            let x_gate = x_gate.apply(per_layer_projection)?;
+            let x_gate = x_gate.apply(post_per_layer_input_norm)?;
+            xs = (residual + x_gate)?;
         }
 
         Ok((xs.broadcast_mul(&self.layer_scalar)?, produced_kv))
@@ -1889,6 +2149,148 @@ impl Gemma4TextModel {
             .collect()
     }
 
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        _extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        let Some(first_layer) = self.layers.first() else {
+            return Ok((vec![0; seq_kv_caches.len()], 0));
+        };
+        let kv_heads = first_layer.self_attn.num_kv_heads;
+        let head_dim = first_layer.self_attn.head_dim;
+
+        let kv_lens: Vec<usize> = seq_kv_caches
+            .iter()
+            .map(|caches| {
+                caches
+                    .first()
+                    .and_then(|c| c.as_ref())
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .collect();
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
+                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+
+            let batched_kv = pad_and_stack_kv_caches(
+                &layer_caches,
+                max_kv_len,
+                kv_heads,
+                head_dim,
+                &self.device,
+                self.dtype,
+            )?;
+
+            if let Some((k, v)) = batched_kv {
+                let k = k.contiguous()?;
+                let v = v.contiguous()?;
+                layer.self_attn.restore_kv_cache(Some((k, v)));
+            } else {
+                layer.self_attn.restore_kv_cache(None);
+            }
+        }
+
+        Ok((kv_lens, max_kv_len))
+    }
+
+    pub fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        _batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        let (batch_size, seq_len) = input_ids.dims2()?;
+        if seq_len != 1 {
+            candle_core::bail!(
+                "Gemma4 batch decode expects input_ids shape [batch, 1], got seq_len={seq_len}"
+            )
+        }
+        if positions.len() != batch_size {
+            candle_core::bail!(
+                "Gemma4 batch decode expects positions.len() == batch, got positions_len={} batch={batch_size}",
+                positions.len()
+            )
+        }
+
+        let inputs_embeds = self.embed_tokens.forward(input_ids)?;
+        let mut xs = (inputs_embeds * (self.hidden_size as f64).sqrt())?;
+        let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
+        let mut produced_layer_kv: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let shared_kv = self.shared_kv_source[layer_idx]
+                .and_then(|src| produced_layer_kv[src].as_ref().map(|(k, v)| (k, v)));
+
+            let per_layer_input = if let Some(ref all_inputs) = per_layer_inputs {
+                Some(all_inputs.narrow(2, layer_idx, 1)?.squeeze(2)?)
+            } else {
+                None
+            };
+
+            let (new_xs, produced_kv) = layer.forward_with_batch_positions(
+                &xs,
+                per_layer_input.as_ref(),
+                attention_mask,
+                positions,
+                shared_kv,
+                self.decode_prefix_kv_source.as_deref(),
+            )?;
+            xs = new_xs;
+            produced_layer_kv[layer_idx] = produced_kv;
+        }
+
+        let logits = xs
+            .narrow(1, seq_len - 1, 1)?
+            .apply(&self.norm)?
+            .apply(&self.lm_head)?;
+
+        match self.final_logit_softcapping {
+            None => Ok(logits),
+            Some(sc) => (logits / sc)?.tanh()? * sc,
+        }
+    }
+
+    pub fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_seqs = kv_lens.len();
+        let num_layers = self.layers.len();
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+            .map(|_| Vec::with_capacity(num_layers))
+            .collect();
+
+        for layer in self.layers.iter_mut() {
+            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_tensors() {
+                for i in 0..n_seqs {
+                    let row_k = full_k.narrow(0, i, 1)?;
+                    let row_v = full_v.narrow(0, i, 1)?;
+                    let total = kv_lens[i] + rounds_done;
+                    let offset = original_max_kv - kv_lens[i];
+                    let clean = Some((
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
+                    ));
+                    result[i].push(clean);
+                }
+            } else {
+                for i in 0..n_seqs {
+                    result[i].push(None);
+                }
+            }
+            layer.self_attn.clear_kv_cache();
+        }
+
+        Ok(result)
+    }
+
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
@@ -1902,4 +2304,93 @@ impl Gemma4TextModel {
             .map(|layer| layer.is_sliding)
             .unwrap_or(false)
     }
+}
+
+pub fn build_batch_decode_mask(
+    kv_lens: &[usize],
+    original_max_kv: usize,
+    total_width: usize,
+    device: &Device,
+    dtype: DType,
+) -> candle_core::Result<Option<Tensor>> {
+    if kv_lens.iter().all(|&len| len == original_max_kv) {
+        return Ok(None);
+    }
+
+    let n = kv_lens.len();
+    let mut mask_data = vec![0f32; n * total_width];
+    for i in 0..n {
+        let pad_end = (original_max_kv - kv_lens[i]).min(total_width);
+        for j in 0..pad_end {
+            mask_data[i * total_width + j] = -1e9;
+        }
+    }
+    let mask = Tensor::from_vec(mask_data, (n, total_width), device)?.to_dtype(dtype)?;
+    Ok(Some(mask.unsqueeze(1)?.unsqueeze(1)?))
+}
+
+fn pad_and_stack_kv_caches(
+    caches: &[&Option<(Tensor, Tensor)>],
+    max_len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    device: &Device,
+    dtype: DType,
+) -> candle_core::Result<Option<(Tensor, Tensor)>> {
+    if max_len == 0 {
+        return Ok(None);
+    }
+
+    let n = caches.len();
+    let mut padded_ks = Vec::with_capacity(n);
+    let mut padded_vs = Vec::with_capacity(n);
+    let max_pad_needed = caches
+        .iter()
+        .map(|cache| match cache {
+            Some((k, _)) => max_len.saturating_sub(k.dim(2).unwrap_or(0)),
+            None => max_len,
+        })
+        .max()
+        .unwrap_or(0);
+    let zero_pad = if max_pad_needed > 0 {
+        Some(Tensor::zeros(
+            (1, kv_heads, max_pad_needed, head_dim),
+            dtype,
+            device,
+        )?)
+    } else {
+        None
+    };
+
+    for cache in caches {
+        match cache {
+            Some((k, v)) => {
+                let cur = k.dim(2)?;
+                let pad = max_len.saturating_sub(cur);
+                if pad > 0 {
+                    let zeros = zero_pad
+                        .as_ref()
+                        .expect("zero_pad present for non-zero pad")
+                        .narrow(2, 0, pad)?;
+                    padded_ks.push(Tensor::cat(&[&zeros, k], 2)?);
+                    padded_vs.push(Tensor::cat(&[&zeros, v], 2)?);
+                } else {
+                    padded_ks.push(k.clone());
+                    padded_vs.push(v.clone());
+                }
+            }
+            None => {
+                let zeros = zero_pad
+                    .as_ref()
+                    .expect("zero_pad present when max_len > 0")
+                    .narrow(2, 0, max_len)?;
+                padded_ks.push(zeros.clone());
+                padded_vs.push(zeros);
+            }
+        }
+    }
+
+    let k_refs = padded_ks.iter().collect::<Vec<_>>();
+    let v_refs = padded_vs.iter().collect::<Vec<_>>();
+    Ok(Some((Tensor::cat(&k_refs, 0)?, Tensor::cat(&v_refs, 0)?)))
 }

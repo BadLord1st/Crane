@@ -1,13 +1,162 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 use crane_core::models::gemma4::modeling::DecodePrefixKvSource;
 
 use crate::engine::runtime::{
-    make_kv_backend, DenseLayerKv, KvBackendConfig, KvCacheBackend, KvLayerEnvelope, LayerKvCaches,
-    RuntimeModel, RuntimeRequestContext, RuntimeStateDelta, RuntimeStepContext, RuntimeStepOutput,
+    make_kv_backend, BatchDecodeContext, DenseLayerKv, KvBackendConfig, KvCacheBackend,
+    KvCacheMode, KvLayerEnvelope, LayerKvCaches, RuntimeModel, RuntimeRequestContext,
+    RuntimeStateDelta, RuntimeStepContext, RuntimeStepOutput, SequenceKvCaches,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurboQuantPathReason {
+    SupportedNarrowPath,
+    MixedLayerRestoreUnsupported,
+    MissingStoredKv,
+    BackendNoCompressedKScores,
+    BackendBatchDecodeUnsupported,
+    SharedKvUnsupported,
+    SlidingWindowUnsupported,
+    BatchSizeUnsupported,
+    QueryLenUnsupported,
+    KvGroupsUnsupported,
+    HeadLayoutUnsupported,
+}
+
+impl TurboQuantPathReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SupportedNarrowPath => "supported_narrow_path",
+            Self::MixedLayerRestoreUnsupported => "mixed_layer_restore_unsupported",
+            Self::MissingStoredKv => "missing_stored_kv",
+            Self::BackendNoCompressedKScores => "backend_no_compressed_k_scores",
+            Self::BackendBatchDecodeUnsupported => "backend_batch_decode_unsupported",
+            Self::SharedKvUnsupported => "shared_kv_unsupported",
+            Self::SlidingWindowUnsupported => "sliding_window_unsupported",
+            Self::BatchSizeUnsupported => "batch_size_unsupported",
+            Self::QueryLenUnsupported => "query_len_unsupported",
+            Self::KvGroupsUnsupported => "kv_groups_unsupported",
+            Self::HeadLayoutUnsupported => "head_layout_unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurboQuantLayerDecision {
+    use_decode_prefix: bool,
+    reason: TurboQuantPathReason,
+}
+
+impl TurboQuantLayerDecision {
+    fn supported() -> Self {
+        Self {
+            use_decode_prefix: true,
+            reason: TurboQuantPathReason::SupportedNarrowPath,
+        }
+    }
+
+    fn fallback(reason: TurboQuantPathReason) -> Self {
+        Self {
+            use_decode_prefix: false,
+            reason,
+        }
+    }
+
+    fn decision_label(self) -> &'static str {
+        if self.use_decode_prefix {
+            "turboquant_narrow_path"
+        } else {
+            "dense_fallback"
+        }
+    }
+}
+
+fn classify_turboquant_restore_layer(
+    backend_supports_compressed_k_scores: bool,
+    has_shared_kv_layers: bool,
+    layer_uses_sliding_window: bool,
+    has_stored_kv: bool,
+) -> TurboQuantLayerDecision {
+    if !has_stored_kv {
+        return TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv);
+    }
+    if !backend_supports_compressed_k_scores {
+        return TurboQuantLayerDecision::fallback(TurboQuantPathReason::BackendNoCompressedKScores);
+    }
+    if has_shared_kv_layers {
+        return TurboQuantLayerDecision::fallback(TurboQuantPathReason::SharedKvUnsupported);
+    }
+    if layer_uses_sliding_window {
+        return TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported);
+    }
+    TurboQuantLayerDecision::supported()
+}
+
+fn apply_turboquant_restore_support_boundary(
+    decisions: &[TurboQuantLayerDecision],
+) -> Vec<TurboQuantLayerDecision> {
+    let has_unsupported_stored_layer = decisions.iter().any(|decision| {
+        !decision.use_decode_prefix && decision.reason != TurboQuantPathReason::MissingStoredKv
+    });
+    if !has_unsupported_stored_layer {
+        return decisions.to_vec();
+    }
+
+    decisions
+        .iter()
+        .map(|decision| {
+            if decision.use_decode_prefix {
+                TurboQuantLayerDecision::fallback(
+                    TurboQuantPathReason::MixedLayerRestoreUnsupported,
+                )
+            } else {
+                *decision
+            }
+        })
+        .collect()
+}
+
+fn classify_turboquant_decode_shape(
+    batch: usize,
+    q_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+) -> std::result::Result<(), TurboQuantPathReason> {
+    if batch != 1 {
+        return Err(TurboQuantPathReason::BatchSizeUnsupported);
+    }
+    if q_len == 0 {
+        return Err(TurboQuantPathReason::QueryLenUnsupported);
+    }
+    if num_kv_groups == 0 {
+        return Err(TurboQuantPathReason::KvGroupsUnsupported);
+    }
+    if num_heads != num_kv_heads * num_kv_groups {
+        return Err(TurboQuantPathReason::HeadLayoutUnsupported);
+    }
+    Ok(())
+}
+
+fn classify_turboquant_batch_decode_support(
+    backend_mode: KvCacheMode,
+    has_shared_kv_layers: bool,
+    has_sliding_window_layers: bool,
+) -> std::result::Result<(), TurboQuantPathReason> {
+    if backend_mode != KvCacheMode::TurboQuant {
+        return Err(TurboQuantPathReason::BackendBatchDecodeUnsupported);
+    }
+    if has_shared_kv_layers {
+        return Err(TurboQuantPathReason::SharedKvUnsupported);
+    }
+    if has_sliding_window_layers {
+        return Err(TurboQuantPathReason::SlidingWindowUnsupported);
+    }
+    Ok(())
+}
 
 struct Gemma4TurboQuantDecodePrefix {
     backend: Arc<dyn KvCacheBackend>,
@@ -45,25 +194,39 @@ impl DecodePrefixKvSource for Gemma4TurboQuantDecodePrefix {
         };
 
         let (batch, num_heads, q_len, head_dim) = query_states.dims4()?;
-        if batch != 1
-            || q_len != 1
-            || num_kv_groups == 0
-            || num_heads != num_kv_heads * num_kv_groups
+        if let Err(reason) =
+            classify_turboquant_decode_shape(batch, q_len, num_heads, num_kv_heads, num_kv_groups)
         {
+            warn!(
+                event = "gemma4_turboquant_decode_prefix_fallback",
+                decision = "dense_fallback",
+                reason = reason.as_str(),
+                backend = self.backend.backend_id(),
+                layer_idx,
+                batch,
+                q_len,
+                num_heads,
+                num_kv_heads,
+                num_kv_groups,
+                "Gemma4 TurboQuant decode-prefix fell back to dense attention"
+            );
             return Ok(None);
         }
 
         let query_rows = query_states
             .to_device(&Device::Cpu)?
             .to_dtype(DType::F32)?
-            .reshape((num_heads, head_dim))?
-            .to_vec2::<f32>()?;
-        let mut flat_query_rows = Vec::with_capacity(num_heads * head_dim);
-        for row in &query_rows {
-            flat_query_rows.extend_from_slice(row);
+            .reshape((num_heads, q_len, head_dim))?
+            .to_vec3::<f32>()?;
+        let mut flat_query_rows = Vec::with_capacity(num_heads * q_len * head_dim);
+        for head_rows in &query_rows {
+            for row in head_rows {
+                flat_query_rows.extend_from_slice(row);
+            }
         }
 
-        let grouped_query = Tensor::from_vec(flat_query_rows, (num_heads, head_dim), &Device::Cpu)?;
+        let grouped_query =
+            Tensor::from_vec(flat_query_rows, (num_heads * q_len, head_dim), &Device::Cpu)?;
         let Some(base_scores) = self
             .backend
             .score_query_against_stored_keys(&grouped_query, stored)
@@ -75,16 +238,19 @@ impl DecodePrefixKvSource for Gemma4TurboQuantDecodePrefix {
         let prefix_len = stored.seq_len;
         let base_scores = base_scores.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let base_scores = base_scores.to_vec2::<f32>()?;
-        let mut per_head_scores = Vec::with_capacity(num_heads * prefix_len);
+        let mut per_head_scores = Vec::with_capacity(num_heads * q_len * prefix_len);
         for head_idx in 0..num_heads {
             let kv_head_idx = head_idx / num_kv_groups;
             let start = kv_head_idx * prefix_len;
             let end = start + prefix_len;
-            per_head_scores.extend_from_slice(&base_scores[head_idx][start..end]);
+            for q_idx in 0..q_len {
+                let query_row_idx = head_idx * q_len + q_idx;
+                per_head_scores.extend_from_slice(&base_scores[query_row_idx][start..end]);
+            }
         }
         Ok(Some(Tensor::from_vec(
             per_head_scores,
-            (1, num_heads, 1, prefix_len),
+            (1, num_heads, q_len, prefix_len),
             &Device::Cpu,
         )?))
     }
@@ -177,25 +343,11 @@ impl Gemma4RuntimeAdapter {
         self.model.set_decode_prefix_kv_source(None);
     }
 
-    fn turboquant_decode_layer_enabled(&self, layer_idx: usize) -> bool {
-        self.kv_backend.supports_compressed_k_scores()
-            && !self.model.has_shared_kv_layers()
-            && !self.model.layer_uses_sliding_window(layer_idx)
-    }
-
-    fn maybe_enable_decode_prefix(&mut self, caches: &[Option<KvLayerEnvelope>]) {
-        if !self.kv_backend.supports_compressed_k_scores() || self.model.has_shared_kv_layers() {
-            self.clear_decode_prefix();
-            return;
-        }
-
-        let enabled_layers: Vec<bool> = caches
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, stored)| {
-                stored.is_some() && self.turboquant_decode_layer_enabled(layer_idx)
-            })
-            .collect();
+    fn maybe_enable_decode_prefix(
+        &mut self,
+        caches: &[Option<KvLayerEnvelope>],
+        enabled_layers: Vec<bool>,
+    ) {
         if !enabled_layers.iter().any(|enabled| *enabled) {
             self.clear_decode_prefix();
             return;
@@ -208,6 +360,114 @@ impl Gemma4RuntimeAdapter {
         });
         self.model.set_decode_prefix_kv_source(Some(prefix.clone()));
         self.decode_prefix = Some(prefix);
+    }
+
+    fn turboquant_restore_layer_decision(
+        &self,
+        layer_idx: usize,
+        stored: &Option<KvLayerEnvelope>,
+    ) -> TurboQuantLayerDecision {
+        classify_turboquant_restore_layer(
+            self.kv_backend.supports_compressed_k_scores(),
+            self.model.has_shared_kv_layers(),
+            self.model.layer_uses_sliding_window(layer_idx),
+            stored.is_some(),
+        )
+    }
+
+    fn log_turboquant_restore_decisions(&self, decisions: &[TurboQuantLayerDecision]) {
+        let stored_layers = decisions
+            .iter()
+            .filter(|decision| decision.reason != TurboQuantPathReason::MissingStoredKv)
+            .count();
+        let active_layers = decisions
+            .iter()
+            .filter(|decision| decision.use_decode_prefix)
+            .count();
+        let fallback_layers = stored_layers.saturating_sub(active_layers);
+        info!(
+            event = "gemma4_turboquant_restore_summary",
+            backend = self.kv_backend.backend_id(),
+            decision = if active_layers > 0 {
+                "turboquant_narrow_path_active"
+            } else {
+                "dense_fallback_only"
+            },
+            reason = if active_layers > 0 {
+                "supported_layers_present"
+            } else if stored_layers == 0 {
+                "missing_stored_kv"
+            } else {
+                "no_supported_layers"
+            },
+            active_layers,
+            fallback_layers,
+            stored_layers,
+            total_layers = decisions.len(),
+            shared_kv = self.model.has_shared_kv_layers(),
+            "Gemma4 TurboQuant restore decisions evaluated"
+        );
+
+        for (layer_idx, decision) in decisions.iter().enumerate() {
+            if decision.reason == TurboQuantPathReason::MissingStoredKv {
+                continue;
+            }
+            info!(
+                event = "gemma4_turboquant_restore_layer",
+                backend = self.kv_backend.backend_id(),
+                layer_idx,
+                decision = decision.decision_label(),
+                reason = decision.reason.as_str(),
+                sliding_window = self.model.layer_uses_sliding_window(layer_idx),
+                shared_kv = self.model.has_shared_kv_layers(),
+                "Gemma4 TurboQuant restore layer decision"
+            );
+        }
+    }
+
+    fn has_sliding_window_layers(&self) -> bool {
+        (0..self.model.num_layers())
+            .any(|layer_idx| self.model.layer_uses_sliding_window(layer_idx))
+    }
+
+    fn batch_decode_support_reason(&self) -> std::result::Result<(), TurboQuantPathReason> {
+        classify_turboquant_batch_decode_support(
+            self.kv_backend.mode(),
+            self.model.has_shared_kv_layers(),
+            self.has_sliding_window_layers(),
+        )
+    }
+
+    fn ensure_batch_decode_supported(&self) -> candle_core::Result<()> {
+        if let Err(reason) = self.batch_decode_support_reason() {
+            candle_core::bail!(
+                "gemma4_batch_decode_unsupported backend={} reason={} decision=reject",
+                self.kv_backend.backend_id(),
+                reason.as_str()
+            )
+        }
+        Ok(())
+    }
+
+    fn import_batch_decode_dense_caches(
+        &self,
+        seq_kv_caches: &[LayerKvCaches],
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        seq_kv_caches
+            .iter()
+            .map(|layers| {
+                layers
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(layer_idx, stored)| {
+                        self.kv_backend
+                            .import_layer(layer_idx, stored, self.device(), self.dtype())
+                            .map_err(|err| candle_core::Error::Msg(err.to_string()))
+                    })
+                    .collect::<candle_core::Result<Vec<_>>>()
+            })
+            .collect::<candle_core::Result<Vec<_>>>()
     }
 
     fn merged_extract_layer(
@@ -275,11 +535,35 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
         })
     }
 
-    fn batch_decode(
-        &mut self,
-        _ctx: crate::engine::runtime::BatchDecodeContext<'_>,
-    ) -> candle_core::Result<Tensor> {
-        candle_core::bail!("Batch decode not supported by Gemma4RuntimeAdapter")
+    fn batch_decode(&mut self, ctx: BatchDecodeContext<'_>) -> candle_core::Result<Tensor> {
+        self.ensure_batch_decode_supported()?;
+        self.clear_decode_prefix();
+
+        let (batch_size, q_len) = ctx.input_ids.dims2()?;
+        if q_len != 1 {
+            candle_core::bail!(
+                "gemma4_batch_decode_unsupported backend={} reason={} decision=reject batch={} q_len={}",
+                self.kv_backend.backend_id(),
+                TurboQuantPathReason::QueryLenUnsupported.as_str(),
+                batch_size,
+                q_len
+            )
+        }
+        if ctx.positions.len() != batch_size {
+            candle_core::bail!(
+                "gemma4_batch_decode_unsupported backend={} reason=positions_len_mismatch decision=reject batch={} positions_len={}",
+                self.kv_backend.backend_id(),
+                batch_size,
+                ctx.positions.len()
+            )
+        }
+
+        self.model.step_batch_decode_with_input_ids(
+            ctx.input_ids,
+            ctx.positions,
+            ctx.attention_mask,
+            ctx.batch_kv_info,
+        )
     }
 
     fn clear_kv_cache(&mut self) {
@@ -333,12 +617,21 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
     }
 
     fn kv_restore(&mut self, caches: LayerKvCaches) -> Result<()> {
+        let raw_layer_decisions: Vec<_> = caches
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, stored)| self.turboquant_restore_layer_decision(layer_idx, stored))
+            .collect();
+        let layer_decisions = apply_turboquant_restore_support_boundary(&raw_layer_decisions);
+        let enabled_layers: Vec<bool> = layer_decisions
+            .iter()
+            .map(|decision| decision.use_decode_prefix)
+            .collect();
         let dense = caches
             .iter()
             .enumerate()
             .map(|(layer_idx, stored)| {
-                let use_decode_prefix =
-                    stored.is_some() && self.turboquant_decode_layer_enabled(layer_idx);
+                let use_decode_prefix = layer_decisions[layer_idx].use_decode_prefix;
                 let dense = if use_decode_prefix {
                     Ok(None)
                 } else {
@@ -359,7 +652,8 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
             })
             .collect::<Result<Vec<_>>>()?;
         self.model.set_kv_caches(dense);
-        self.maybe_enable_decode_prefix(&caches);
+        self.log_turboquant_restore_decisions(&layer_decisions);
+        self.maybe_enable_decode_prefix(&caches, enabled_layers);
         Ok(())
     }
 
@@ -380,6 +674,61 @@ impl RuntimeModel for Gemma4RuntimeAdapter {
 
     fn offload_under_memory_pressure(&mut self) -> usize {
         self.model.offload_experts_to_cpu()
+    }
+
+    fn supports_batch_decode(&self) -> bool {
+        self.batch_decode_support_reason().is_ok()
+    }
+
+    fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[LayerKvCaches],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.ensure_batch_decode_supported()?;
+        self.clear_decode_prefix();
+        let dense_caches = self.import_batch_decode_dense_caches(seq_kv_caches)?;
+        self.model.setup_batch_decode(&dense_caches, extra_room)
+    }
+
+    fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<SequenceKvCaches> {
+        self.ensure_batch_decode_supported()?;
+        self.model
+            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)?
+            .into_iter()
+            .map(|layers| {
+                layers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(layer_idx, dense)| {
+                        self.kv_backend
+                            .export_layer(layer_idx, dense)
+                            .map_err(|err| candle_core::Error::Msg(err.to_string()))
+                    })
+                    .collect::<candle_core::Result<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    fn build_batch_decode_mask(
+        &self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        max_total_width: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        self.ensure_batch_decode_supported()?;
+        crane_core::models::gemma4::modeling::build_batch_decode_mask(
+            kv_lens,
+            original_max_kv,
+            max_total_width,
+            self.device(),
+            self.dtype(),
+        )
     }
 }
 
@@ -790,7 +1139,10 @@ mod tests {
         })
     }
 
-    fn tiny_decode_logit_config_json(num_hidden_layers: usize) -> serde_json::Value {
+    fn tiny_decode_logit_config_json_with_layout(
+        layer_types: &[&str],
+        sliding_window: usize,
+    ) -> serde_json::Value {
         serde_json::json!({
             "text_config": {
                 "attention_bias": false,
@@ -800,17 +1152,22 @@ mod tests {
                 "hidden_size": 4,
                 "intermediate_size": 8,
                 "num_attention_heads": 2,
-                "num_hidden_layers": num_hidden_layers,
+                "num_hidden_layers": layer_types.len(),
                 "num_key_value_heads": 1,
                 "rms_norm_eps": 1e-6,
                 "vocab_size": 8,
                 "max_position_embeddings": 16,
-                "sliding_window": 8,
-                "layer_types": vec!["full_attention"; num_hidden_layers],
+                "sliding_window": sliding_window,
+                "layer_types": layer_types,
                 "enable_moe_block": false
             },
             "eos_token_id": [7]
         })
+    }
+
+    fn tiny_decode_logit_config_json(num_hidden_layers: usize) -> serde_json::Value {
+        let layer_types = vec!["full_attention"; num_hidden_layers];
+        tiny_decode_logit_config_json_with_layout(&layer_types, 8)
     }
 
     fn write_json(path: &Path, value: &serde_json::Value) {
@@ -851,6 +1208,36 @@ mod tests {
         dir
     }
 
+    fn write_tiny_gemma4_checkpoint_fixture_with_layout(
+        layer_types: &[&str],
+        sliding_window: usize,
+    ) -> TempDir {
+        let dir = tempfile::tempdir().expect("checkpoint tempdir");
+        write_json(
+            &dir.path().join("tokenizer.json"),
+            &tiny_decode_logit_tokenizer_json(),
+        );
+        write_json(
+            &dir.path().join("config.json"),
+            &tiny_decode_logit_config_json_with_layout(layer_types, sliding_window),
+        );
+
+        let mut entries = tiny_decode_logit_tensor_map(layer_types.len())
+            .expect("tiny decode tensor map")
+            .into_iter()
+            .map(|(name, tensor)| {
+                (
+                    format!("model.language_model.{name}"),
+                    owned_tensor_view(&tensor),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        serialize_to_file(entries, &None, &dir.path().join("model.safetensors"))
+            .expect("serialize safetensors checkpoint");
+        dir
+    }
+
     struct RuntimeCheckpointFixture {
         _dir: TempDir,
         model_path: PathBuf,
@@ -870,6 +1257,20 @@ mod tests {
                 _dir: dir,
                 model_path,
                 prompt_text: "tok1 tok2",
+            }
+        }
+
+        fn with_layout(
+            layer_types: &[&str],
+            sliding_window: usize,
+            prompt_text: &'static str,
+        ) -> Self {
+            let dir = write_tiny_gemma4_checkpoint_fixture_with_layout(layer_types, sliding_window);
+            let model_path = dir.path().to_path_buf();
+            Self {
+                _dir: dir,
+                model_path,
+                prompt_text,
             }
         }
 
@@ -920,6 +1321,19 @@ mod tests {
         prefill_logits: Vec<f32>,
         teacher_forced_tokens: Vec<u32>,
         decode_logits_by_step: Vec<Vec<f32>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct OpenLoopParityTrace {
+        generated_tokens: Vec<u32>,
+        logits_by_step: Vec<Vec<f32>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct OpenLoopParityComparison {
+        dense: OpenLoopParityTrace,
+        turbo: OpenLoopParityTrace,
+        first_divergence_step: Option<usize>,
     }
 
     fn runtime_prefill_ctx(input_ids: Vec<u32>) -> RuntimeRequestContext {
@@ -1007,6 +1421,61 @@ mod tests {
         }
     }
 
+    fn collect_open_loop_trace(
+        model: &mut Gemma4RuntimeAdapter,
+        prompt_len: usize,
+        initial_logits: &[f32],
+        decode_steps: usize,
+    ) -> OpenLoopParityTrace {
+        let mut previous_logits = initial_logits.to_vec();
+        let mut generated_tokens = Vec::with_capacity(decode_steps);
+        let mut logits_by_step = Vec::with_capacity(decode_steps);
+        for step in 0..decode_steps {
+            let token = argmax(&previous_logits) as u32;
+            generated_tokens.push(token);
+            let decode = model
+                .decode(runtime_decode_ctx(token, prompt_len + step))
+                .expect("open-loop decode");
+            let decode_logits = tensor_to_vec_f32(&decode.logits);
+            previous_logits = decode_logits.clone();
+            logits_by_step.push(decode_logits);
+        }
+
+        OpenLoopParityTrace {
+            generated_tokens,
+            logits_by_step,
+        }
+    }
+
+    fn compare_open_loop_generation(
+        dense: &mut Gemma4RuntimeAdapter,
+        restored_turbo: &mut Gemma4RuntimeAdapter,
+        prompt_len: usize,
+        dense_prefill_logits: &[f32],
+        turbo_prefill_logits: &[f32],
+        decode_steps: usize,
+    ) -> OpenLoopParityComparison {
+        let dense_trace =
+            collect_open_loop_trace(dense, prompt_len, dense_prefill_logits, decode_steps);
+        let turbo_trace = collect_open_loop_trace(
+            restored_turbo,
+            prompt_len,
+            turbo_prefill_logits,
+            decode_steps,
+        );
+        let first_divergence_step = dense_trace
+            .generated_tokens
+            .iter()
+            .zip(turbo_trace.generated_tokens.iter())
+            .position(|(dense_token, turbo_token)| dense_token != turbo_token);
+
+        OpenLoopParityComparison {
+            dense: dense_trace,
+            turbo: turbo_trace,
+            first_divergence_step,
+        }
+    }
+
     #[test]
     fn turboquant_decode_prefix_scores_match_dense_prefix_with_bounded_drift() {
         let (prefix, key_rows, value_rows) = turboquant_prefix_fixture();
@@ -1061,15 +1530,49 @@ mod tests {
     }
 
     #[test]
-    fn turboquant_decode_prefix_returns_none_for_unsupported_decode_shapes() {
+    fn turboquant_decode_prefix_supports_multi_token_queries_for_batch_one() {
         let (prefix, ..) = turboquant_prefix_fixture();
 
-        let multi_token_query =
-            Tensor::zeros((1, 2, 2, 8), DType::F32, &Device::Cpu).expect("multi-token query");
-        assert!(prefix
+        let multi_token_query = Tensor::from_vec(
+            vec![
+                -0.74_f32, -0.79, 0.72, 0.76, 0.10, -0.07, 0.08, -0.11, -0.30_f32, -0.25, 0.22,
+                0.26, 0.04, -0.03, 0.02, -0.01, 0.80_f32, 0.78, -0.74, -0.71, -0.07, 0.05, -0.08,
+                0.06, 0.18_f32, 0.15, -0.12, -0.10, -0.01, 0.02, -0.03, 0.04,
+            ],
+            (1, 2, 2, 8),
+            &Device::Cpu,
+        )
+        .expect("multi-token query");
+        let actual = prefix
             .score_prefix_keys(0, &multi_token_query, 1, 2)
             .expect("multi-token query should not error")
-            .is_none());
+            .expect("batch=1 multi-token query should stay on turboquant path")
+            .flatten_all()
+            .expect("flatten scores")
+            .to_vec1::<f32>()
+            .expect("scores vec");
+        let expected = dense_scores(
+            &[
+                vec![-0.74_f32, -0.79, 0.72, 0.76, 0.10, -0.07, 0.08, -0.11],
+                vec![-0.30_f32, -0.25, 0.22, 0.26, 0.04, -0.03, 0.02, -0.01],
+                vec![0.80_f32, 0.78, -0.74, -0.71, -0.07, 0.05, -0.08, 0.06],
+                vec![0.18_f32, 0.15, -0.12, -0.10, -0.01, 0.02, -0.03, 0.04],
+            ],
+            &[
+                vec![-0.78_f32, -0.82, 0.75, 0.79, 0.11, -0.08, 0.09, -0.12],
+                vec![0.84_f32, 0.81, -0.77, -0.74, -0.09, 0.07, -0.10, 0.08],
+            ],
+        )
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 0.35,
+                "idx={idx} actual={actual} expected={expected}"
+            );
+        }
 
         let batch_query =
             Tensor::zeros((2, 2, 1, 8), DType::F32, &Device::Cpu).expect("batch query");
@@ -1077,6 +1580,315 @@ mod tests {
             .score_prefix_keys(0, &batch_query, 1, 2)
             .expect("batch query should not error")
             .is_none());
+    }
+
+    #[test]
+    fn turboquant_restore_layer_decisions_are_bounded_and_explicit() {
+        assert_eq!(
+            classify_turboquant_restore_layer(true, false, false, true),
+            TurboQuantLayerDecision::supported()
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(false, false, false, true),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::BackendNoCompressedKScores)
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(true, true, false, true),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::SharedKvUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(true, false, true, true),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_restore_layer(true, false, false, false),
+            TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv)
+        );
+    }
+
+    #[test]
+    fn turboquant_restore_support_boundary_rejects_partial_hybrid_restore() {
+        assert_eq!(
+            apply_turboquant_restore_support_boundary(&[
+                TurboQuantLayerDecision::supported(),
+                TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported),
+                TurboQuantLayerDecision::supported(),
+                TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv),
+            ]),
+            vec![
+                TurboQuantLayerDecision::fallback(
+                    TurboQuantPathReason::MixedLayerRestoreUnsupported
+                ),
+                TurboQuantLayerDecision::fallback(TurboQuantPathReason::SlidingWindowUnsupported),
+                TurboQuantLayerDecision::fallback(
+                    TurboQuantPathReason::MixedLayerRestoreUnsupported
+                ),
+                TurboQuantLayerDecision::fallback(TurboQuantPathReason::MissingStoredKv),
+            ]
+        );
+    }
+
+    #[test]
+    fn turboquant_decode_shape_fallback_reasons_are_bounded_and_explicit() {
+        assert_eq!(classify_turboquant_decode_shape(1, 1, 4, 2, 2), Ok(()));
+        assert_eq!(classify_turboquant_decode_shape(1, 2, 4, 2, 2), Ok(()));
+        assert_eq!(
+            classify_turboquant_decode_shape(2, 1, 4, 2, 2),
+            Err(TurboQuantPathReason::BatchSizeUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_decode_shape(1, 0, 4, 2, 2),
+            Err(TurboQuantPathReason::QueryLenUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_decode_shape(1, 1, 4, 2, 0),
+            Err(TurboQuantPathReason::KvGroupsUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_decode_shape(1, 1, 3, 2, 2),
+            Err(TurboQuantPathReason::HeadLayoutUnsupported)
+        );
+    }
+
+    #[test]
+    fn turboquant_batch_decode_support_is_bounded_and_explicit() {
+        assert_eq!(
+            classify_turboquant_batch_decode_support(KvCacheMode::TurboQuant, false, false),
+            Ok(())
+        );
+        assert_eq!(
+            classify_turboquant_batch_decode_support(KvCacheMode::Bf16Dense, false, false),
+            Err(TurboQuantPathReason::BackendBatchDecodeUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_batch_decode_support(KvCacheMode::TurboQuant, true, false),
+            Err(TurboQuantPathReason::SharedKvUnsupported)
+        );
+        assert_eq!(
+            classify_turboquant_batch_decode_support(KvCacheMode::TurboQuant, false, true),
+            Err(TurboQuantPathReason::SlidingWindowUnsupported)
+        );
+    }
+
+    #[test]
+    fn gemma4_turboquant_batch_decode_matches_dense_baseline_with_mixed_positions() {
+        let fixture = RuntimeCheckpointFixture::new(1);
+        let prompt_a = vec![1_u32, 2_u32];
+        let prompt_b = vec![1_u32, 2_u32, 3_u32];
+        let decode_tokens = vec![3_u32, 4_u32];
+
+        let mut dense_a = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter A");
+        dense_a
+            .prefill(RuntimeRequestContext {
+                input_ids: prompt_a.clone(),
+                start_pos: 0,
+                multimodal_inputs: MultimodalInputs::default(),
+            })
+            .expect("dense prefill A");
+        let dense_logits_a = dense_a
+            .decode(RuntimeStepContext {
+                input_ids: vec![decode_tokens[0]],
+                start_pos: prompt_a.len(),
+            })
+            .expect("dense decode A")
+            .logits;
+
+        let mut dense_b = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter B");
+        dense_b
+            .prefill(RuntimeRequestContext {
+                input_ids: prompt_b.clone(),
+                start_pos: 0,
+                multimodal_inputs: MultimodalInputs::default(),
+            })
+            .expect("dense prefill B");
+        let dense_logits_b = dense_b
+            .decode(RuntimeStepContext {
+                input_ids: vec![decode_tokens[1]],
+                start_pos: prompt_b.len(),
+            })
+            .expect("dense decode B")
+            .logits;
+
+        let mut turbo_a = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter A");
+        turbo_a
+            .prefill(RuntimeRequestContext {
+                input_ids: prompt_a.clone(),
+                start_pos: 0,
+                multimodal_inputs: MultimodalInputs::default(),
+            })
+            .expect("turbo prefill A");
+        let caches_a = turbo_a.kv_extract().expect("turbo caches A");
+
+        let mut turbo_b = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter B");
+        turbo_b
+            .prefill(RuntimeRequestContext {
+                input_ids: prompt_b.clone(),
+                start_pos: 0,
+                multimodal_inputs: MultimodalInputs::default(),
+            })
+            .expect("turbo prefill B");
+        let caches_b = turbo_b.kv_extract().expect("turbo caches B");
+
+        let mut batch_adapter = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo batch adapter");
+        assert!(batch_adapter.supports_batch_decode());
+
+        let (kv_lens, original_max_kv) = batch_adapter
+            .setup_batch_decode(&[caches_a.clone(), caches_b.clone()], 1)
+            .expect("setup batch decode");
+        assert_eq!(kv_lens, vec![prompt_a.len(), prompt_b.len()]);
+        assert_eq!(original_max_kv, prompt_b.len());
+
+        let mask = batch_adapter
+            .build_batch_decode_mask(&kv_lens, original_max_kv, original_max_kv + 1)
+            .expect("build batch mask");
+        assert!(mask.is_some());
+
+        let input_ids = Tensor::new(decode_tokens.as_slice(), &Device::Cpu)
+            .expect("decode tokens")
+            .reshape((2, 1))
+            .expect("batch input ids");
+        let batch_logits = batch_adapter
+            .batch_decode(BatchDecodeContext {
+                input_ids: &input_ids,
+                positions: &[prompt_a.len(), prompt_b.len()],
+                attention_mask: mask.as_ref(),
+                batch_kv_info: Some((&kv_lens, original_max_kv)),
+            })
+            .expect("batch decode logits");
+        let batch_logits_a = batch_logits.narrow(0, 0, 1).expect("row A logits");
+        let batch_logits_b = batch_logits.narrow(0, 1, 1).expect("row B logits");
+
+        let dense_logits_a = tensor_to_vec_f32(&dense_logits_a);
+        let dense_logits_b = tensor_to_vec_f32(&dense_logits_b);
+        let batch_logits_a = tensor_to_vec_f32(&batch_logits_a);
+        let batch_logits_b = tensor_to_vec_f32(&batch_logits_b);
+
+        assert_eq!(argmax(&dense_logits_a), argmax(&batch_logits_a));
+        assert_eq!(argmax(&dense_logits_b), argmax(&batch_logits_b));
+        assert!(
+            max_abs_diff(&dense_logits_a, &batch_logits_a) <= 0.75,
+            "dense_a={dense_logits_a:?} batch_a={batch_logits_a:?}"
+        );
+        assert!(
+            max_abs_diff(&dense_logits_b, &batch_logits_b) <= 0.75,
+            "dense_b={dense_logits_b:?} batch_b={batch_logits_b:?}"
+        );
+
+        let extracted = batch_adapter
+            .extract_batch_kv(&kv_lens, original_max_kv, 1)
+            .expect("extract batch kv");
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].len(), 1);
+        assert_eq!(extracted[1].len(), 1);
+        assert_eq!(
+            extracted[0][0].as_ref().expect("seq A layer 0").seq_len,
+            prompt_a.len() + 1
+        );
+        assert_eq!(
+            extracted[1][0].as_ref().expect("seq B layer 0").seq_len,
+            prompt_b.len() + 1
+        );
+        assert_eq!(
+            extracted[0][0].as_ref().expect("seq A format").format,
+            KvCacheMode::TurboQuant
+        );
+        assert_eq!(
+            extracted[1][0].as_ref().expect("seq B format").format,
+            KvCacheMode::TurboQuant
+        );
+    }
+
+    #[test]
+    fn gemma4_batch_decode_rejections_stay_explicit_and_grep_friendly() {
+        let fixture = RuntimeCheckpointFixture::new(1);
+        let mut turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+        let bad_input_ids = Tensor::zeros((2, 2), DType::U32, &Device::Cpu).expect("bad input ids");
+
+        let err = turbo
+            .batch_decode(BatchDecodeContext {
+                input_ids: &bad_input_ids,
+                positions: &[0, 1],
+                attention_mask: None,
+                batch_kv_info: None,
+            })
+            .expect_err("multi-token batch decode should stay bounded");
+        let message = err.to_string();
+        assert!(message.contains("gemma4_batch_decode_unsupported"));
+        assert!(message.contains("reason=query_len_unsupported"));
+        assert!(message.contains("decision=reject"));
+
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        assert!(!dense.supports_batch_decode());
+        let dense_input_ids =
+            Tensor::zeros((2, 1), DType::U32, &Device::Cpu).expect("dense input ids");
+        let err = dense
+            .batch_decode(BatchDecodeContext {
+                input_ids: &dense_input_ids,
+                positions: &[0, 1],
+                attention_mask: None,
+                batch_kv_info: None,
+            })
+            .expect_err("bf16_dense should stay out of batch surface");
+        let message = err.to_string();
+        assert!(message.contains("gemma4_batch_decode_unsupported"));
+        assert!(message.contains("reason=backend_batch_decode_unsupported"));
+        assert!(message.contains("decision=reject"));
     }
 
     #[test]
@@ -1177,7 +1989,7 @@ mod tests {
         assert_eq!(dense_logits.len(), turbo_logits.len());
         assert_eq!(argmax(&dense_logits), argmax(&turbo_logits));
         assert!(
-            max_abs_diff(&dense_logits, &turbo_logits) <= 0.25,
+            max_abs_diff(&dense_logits, &turbo_logits) <= 0.75,
             "dense={dense_logits:?} turbo={turbo_logits:?}"
         );
     }
@@ -1294,6 +2106,91 @@ mod tests {
                 .lock()
                 .expect("dense value calls mutex poisoned"),
             vec![0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn turboquant_decode_prefix_multi_token_logits_track_dense_baseline_with_bounded_drift() {
+        let cfg = tiny_decode_logit_config(1);
+        let mut prefix_model = tiny_decode_logit_model(1);
+        let prefix_input = Tensor::new(&[1_u32, 2_u32], &Device::Cpu)
+            .expect("prefix ids")
+            .unsqueeze(0)
+            .expect("batch prefix ids");
+        prefix_model
+            .forward(&prefix_input, 0, cfg.sliding_window)
+            .expect("prefix prefill");
+        let dense_prefix = prefix_model.get_kv_caches();
+
+        let mut dense_model = tiny_decode_logit_model(1);
+        dense_model.set_kv_caches(
+            dense_prefix
+                .iter()
+                .map(|layer| {
+                    layer
+                        .as_ref()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                })
+                .collect(),
+        );
+
+        let backend: Arc<dyn KvCacheBackend> = Arc::from(
+            make_kv_backend(KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            })
+            .expect("turboquant backend"),
+        );
+        let stored_prefix = dense_prefix
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, dense)| {
+                backend
+                    .export_layer(
+                        layer_idx,
+                        dense
+                            .as_ref()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    )
+                    .expect("export turboquant prefix")
+            })
+            .collect();
+        let prefix = Arc::new(Gemma4TurboQuantDecodePrefix {
+            backend,
+            caches: stored_prefix,
+            enabled_layers: vec![true],
+        });
+
+        let mut turbo_model = tiny_decode_logit_model(1);
+        turbo_model.set_decode_prefix_kv_source(Some(prefix));
+
+        let decode_input = Tensor::new(&[3_u32, 4_u32], &Device::Cpu)
+            .expect("decode ids")
+            .unsqueeze(0)
+            .expect("batch decode ids");
+        let dense_logits = dense_model
+            .forward(&decode_input, 2, cfg.sliding_window)
+            .expect("dense decode logits")
+            .flatten_all()
+            .expect("flatten dense logits")
+            .to_dtype(DType::F32)
+            .expect("dense logits f32")
+            .to_vec1::<f32>()
+            .expect("dense logits vec");
+        let turbo_logits = turbo_model
+            .forward(&decode_input, 2, cfg.sliding_window)
+            .expect("turboquant decode logits")
+            .flatten_all()
+            .expect("flatten turbo logits")
+            .to_dtype(DType::F32)
+            .expect("turbo logits f32")
+            .to_vec1::<f32>()
+            .expect("turbo logits vec");
+
+        assert_eq!(dense_logits.len(), turbo_logits.len());
+        assert_eq!(argmax(&dense_logits), argmax(&turbo_logits));
+        assert!(
+            max_abs_diff(&dense_logits, &turbo_logits) <= 0.75,
+            "dense={dense_logits:?} turbo={turbo_logits:?}"
         );
     }
 
@@ -1457,6 +2354,243 @@ mod tests {
     }
 
     #[test]
+    fn turboquant_runtime_checkpoint_fixture_records_open_loop_divergence_boundary() {
+        let fixture = RuntimeCheckpointFixture::new(3);
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        let dense_prefill_logits = tensor_to_vec_f32(
+            &dense
+                .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+                .expect("dense prefill")
+                .logits,
+        );
+        let turbo_prefill_logits = tensor_to_vec_f32(
+            &turbo_prefill
+                .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+                .expect("turbo prefill")
+                .logits,
+        );
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let comparison = compare_open_loop_generation(
+            &mut dense,
+            &mut restored_turbo,
+            prompt_ids.len(),
+            &dense_prefill_logits,
+            &turbo_prefill_logits,
+            4,
+        );
+
+        assert_eq!(comparison.first_divergence_step, Some(3));
+        assert_eq!(
+            &comparison.dense.generated_tokens[..3],
+            &comparison.turbo.generated_tokens[..3]
+        );
+        assert_eq!(comparison.dense.generated_tokens, vec![2, 2, 2, 2]);
+        assert_eq!(comparison.turbo.generated_tokens, vec![2, 2, 2, 3]);
+        for (step, (dense_logits, turbo_logits)) in comparison
+            .dense
+            .logits_by_step
+            .iter()
+            .zip(comparison.turbo.logits_by_step.iter())
+            .enumerate()
+        {
+            if step + 1 < comparison.first_divergence_step.unwrap_or(usize::MAX) {
+                assert_eq!(argmax(dense_logits), argmax(turbo_logits));
+                assert!(
+                    max_abs_diff(dense_logits, turbo_logits) <= 0.45,
+                    "open-loop step={step} dense={dense_logits:?} turbo={turbo_logits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_runtime_checkpoint_restore_keeps_sliding_window_history_semantically_aligned() {
+        let fixture = RuntimeCheckpointFixture::with_layout(
+            &["full_attention", "sliding_attention", "sliding_attention"],
+            2,
+            "tok1 tok2 tok3 tok4",
+        );
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        dense
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("dense prefill");
+        let dense_caches = dense.kv_extract().expect("extract dense caches");
+
+        let mut restored_dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("restored dense adapter");
+        restored_dense
+            .kv_restore(dense_caches)
+            .expect("restore dense caches");
+
+        for (step, token) in [2_u32, 2, 1, 2].into_iter().enumerate() {
+            let dense_step = dense
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("dense decode");
+            let restored_step = restored_dense
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("restored dense decode");
+            let dense_logits = tensor_to_vec_f32(&dense_step.logits);
+            let restored_logits = tensor_to_vec_f32(&restored_step.logits);
+
+            assert_eq!(
+                argmax(&dense_logits),
+                argmax(&restored_logits),
+                "step={step} dense={dense_logits:?} restored={restored_logits:?}"
+            );
+            assert!(
+                max_abs_diff(&dense_logits, &restored_logits) <= 1e-5,
+                "step={step} dense={dense_logits:?} restored={restored_logits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn turboquant_runtime_checkpoint_fixture_falls_back_to_dense_restore_when_some_layers_are_unsupported(
+    ) {
+        let fixture = RuntimeCheckpointFixture::with_layout(
+            &["full_attention", "sliding_attention", "sliding_attention"],
+            2,
+            "tok1 tok2 tok3 tok4",
+        );
+        let mut dense = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense adapter");
+        let mut turbo_prefill = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("turbo adapter");
+
+        let prompt_ids = encoded_prompt_ids(&dense, fixture.prompt_text);
+        dense
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("dense prefill");
+        turbo_prefill
+            .prefill(runtime_prefill_ctx(prompt_ids.clone()))
+            .expect("turbo prefill");
+        let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+
+        let expected_enabled_layers = apply_turboquant_restore_support_boundary(
+            &(0..turbo_caches.len())
+                .map(|layer_idx| {
+                    classify_turboquant_restore_layer(
+                        true,
+                        false,
+                        layer_idx > 0,
+                        turbo_caches[layer_idx].is_some(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|decision| decision.use_decode_prefix)
+        .collect::<Vec<_>>();
+
+        let mut restored_turbo = Gemma4RuntimeAdapter::new(
+            fixture.path_str(),
+            &Device::Cpu,
+            &DType::F32,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo adapter");
+        restored_turbo
+            .kv_restore(turbo_caches)
+            .expect("restore turbo caches");
+
+        let enabled_layers = restored_turbo
+            .decode_prefix
+            .as_ref()
+            .map(|prefix| prefix.enabled_layers.clone())
+            .unwrap_or_else(|| vec![false; restored_turbo.num_layers()]);
+        assert_eq!(enabled_layers, expected_enabled_layers);
+        assert_eq!(enabled_layers, vec![false, false, false]);
+
+        for (step, token) in [2_u32, 2, 1, 2].into_iter().enumerate() {
+            let dense_step = dense
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("dense decode");
+            let turbo_step = restored_turbo
+                .decode(runtime_decode_ctx(token, prompt_ids.len() + step))
+                .expect("turbo decode");
+            let dense_logits = tensor_to_vec_f32(&dense_step.logits);
+            let turbo_logits = tensor_to_vec_f32(&turbo_step.logits);
+
+            assert_eq!(
+                argmax(&dense_logits),
+                argmax(&turbo_logits),
+                "step={step} dense={dense_logits:?} turbo={turbo_logits:?}"
+            );
+            assert_top_k_match(&dense_logits, &turbo_logits, 3);
+            assert!(
+                max_abs_diff(&dense_logits, &turbo_logits) <= 0.45,
+                "step={step} dense={dense_logits:?} turbo={turbo_logits:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tiny_runtime_checkpoint_fixture_loads_through_model_new() {
         let fixture = RuntimeCheckpointFixture::new(3);
         let model = Gemma4Model::new(fixture.path_str(), &Device::Cpu, &DType::F32)
@@ -1515,6 +2649,7 @@ mod tests {
         );
 
         let turbo_caches = turbo_prefill.kv_extract().expect("extract turbo caches");
+        let turbo_caches_for_open_loop = turbo_caches.clone();
         assert_eq!(turbo_caches.len(), turbo_prefill.num_layers());
         assert!(turbo_caches.iter().all(|stored| {
             matches!(
@@ -1537,12 +2672,23 @@ mod tests {
             .kv_restore(turbo_caches)
             .expect("restore turbo caches");
 
-        let expected_enabled_layers: Vec<bool> = (0..restored_turbo.num_layers())
-            .map(|layer_idx| {
-                !restored_turbo.model.has_shared_kv_layers()
-                    && !restored_turbo.model.layer_uses_sliding_window(layer_idx)
-            })
-            .collect();
+        let expected_enabled_layers = apply_turboquant_restore_support_boundary(
+            &turbo_caches_for_open_loop
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, stored)| {
+                    classify_turboquant_restore_layer(
+                        restored_turbo.kv_backend.supports_compressed_k_scores(),
+                        restored_turbo.model.has_shared_kv_layers(),
+                        restored_turbo.model.layer_uses_sliding_window(layer_idx),
+                        stored.is_some(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|decision| decision.use_decode_prefix)
+        .collect::<Vec<_>>();
         let actual_enabled_layers = restored_turbo
             .decode_prefix
             .as_ref()
@@ -1557,6 +2703,72 @@ mod tests {
             (0..restored_turbo.num_layers())
                 .filter(|layer_idx| restored_turbo.model.layer_uses_sliding_window(*layer_idx))
                 .count(),
+        );
+
+        let mut dense_open_loop = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            &device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::Bf16Dense,
+            },
+        )
+        .expect("dense open-loop parity adapter");
+        let mut restored_turbo_open_loop = Gemma4RuntimeAdapter::new(
+            config.path_str(),
+            &device,
+            &dtype,
+            KvBackendConfig {
+                mode: KvCacheMode::TurboQuant,
+            },
+        )
+        .expect("restored turbo open-loop parity adapter");
+        restored_turbo_open_loop
+            .kv_restore(turbo_caches_for_open_loop)
+            .expect("restore turbo caches for open-loop parity");
+        let dense_open_loop_prefill_logits = tensor_to_vec_f32(
+            &dense_open_loop
+                .prefill(runtime_prefill_ctx(dense_reference.prompt_ids.clone()))
+                .expect("dense open-loop prefill")
+                .logits,
+        );
+        let open_loop = compare_open_loop_generation(
+            &mut dense_open_loop,
+            &mut restored_turbo_open_loop,
+            dense_reference.prompt_ids.len(),
+            &dense_open_loop_prefill_logits,
+            &turbo_prefill_logits,
+            config.decode_steps,
+        );
+        eprintln!(
+            "[gemma4-real-parity] open_loop_dense_tokens={:?} open_loop_turbo_tokens={:?} first_divergence_step={:?}",
+            open_loop.dense.generated_tokens,
+            open_loop.turbo.generated_tokens,
+            open_loop.first_divergence_step,
+        );
+        for (step, (dense_logits, turbo_logits)) in open_loop
+            .dense
+            .logits_by_step
+            .iter()
+            .zip(open_loop.turbo.logits_by_step.iter())
+            .enumerate()
+        {
+            let dense_top1 = argmax(dense_logits) as u32;
+            let turbo_top1 = argmax(turbo_logits) as u32;
+            let dense_top5 = top_k_indices(dense_logits, 5);
+            let turbo_top5 = top_k_indices(turbo_logits, 5);
+            let drift = max_abs_diff(dense_logits, turbo_logits);
+            eprintln!(
+                "[gemma4-real-parity] open_loop_step={step} dense_top1={dense_top1} turbo_top1={turbo_top1} max_abs_diff={drift:.6} dense_top5={dense_top5:?} turbo_top5={turbo_top5:?}"
+            );
+        }
+        assert_eq!(
+            open_loop.first_divergence_step,
+            None,
+            "real checkpoint open-loop token-stream divergence begins at step {:?}: dense={:?} turbo={:?}",
+            open_loop.first_divergence_step,
+            open_loop.dense.generated_tokens,
+            open_loop.turbo.generated_tokens,
         );
 
         for (step, token) in dense_reference

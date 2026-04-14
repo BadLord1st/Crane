@@ -51,9 +51,20 @@ Purpose: collect narrow-scope dense-vs-TurboQuant evidence on the real 26B A4B s
 Supported slice only:
 - restored prefix
 - `batch=1`
-- `q_len=1`
-- non-sliding / `full_attention` layers only
+- `q_len>=1`
+- all restored layers must be non-sliding / `full_attention`
 - no shared-KV broadening
+
+Restore boundary:
+- if **every** restored layer is in the supported narrow slice, TurboQuant decode-prefix may stay enabled for those layers
+- if **any** restored layer is unsupported (for example sliding-window or shared-KV), the adapter now performs a **semantic-preserving dense restore fallback for all layers** during restore/decode
+- this is intentionally **not** sliding/shared-KV TurboQuant support; it is a bounded parity fallback
+
+Current adapter batch-decode broadening status:
+- `turboquant` runtime batch decode is now supported only for `q_len=1` batched decode over restored KV with mixed positions and padding masks
+- the supported batch path imports stored TurboQuant KV into dense batched model state for the decode step, then re-exports TurboQuant envelopes on extraction
+- `bf16_dense` remains unchanged in this slice
+- sliding-window and shared-KV Gemma4 layers remain explicitly out of scope for batch decode
 
 Command:
 
@@ -72,17 +83,28 @@ Notes:
   - prompt token count and decode-step count
   - prefill dense/turbo top-1 token IDs and max-abs logit drift
   - enabled decode-prefix layer count vs total layer count
+  - open-loop dense/turbo generated token streams and the first divergence step, if any
+  - per-step open-loop dense/turbo top-1 token IDs, top-5 sets, and max-abs logit drift
   - per-step dense/turbo top-1 token IDs, top-5 sets, and max-abs logit drift
+- During restore/decode, structured tracing should also emit grep-friendly TurboQuant decision logs:
+  - `event=gemma4_turboquant_restore_summary`
+  - `event=gemma4_turboquant_restore_layer`
+  - `event=gemma4_turboquant_decode_prefix_fallback`
+- Supported decision categories are bounded and explicit:
+  - `decision=turboquant_narrow_path` with `reason=supported_narrow_path` for `batch=1`, `q_len>=1`, all-layer-supported restored-prefix decode
+  - `decision=dense_fallback` with reasons such as `mixed_layer_restore_unsupported`, `shared_kv_unsupported`, `sliding_window_unsupported`, `backend_no_compressed_k_scores`, `batch_size_unsupported`, `query_len_unsupported`, `kv_groups_unsupported`, or `head_layout_unsupported`
 
 Pass condition:
 - the test exits successfully
+- the open-loop dense/turbo generated token streams stay identical for the requested step count
 - every compared decode step keeps dense/turbo top-1 agreement
 - extracted restored KV payloads remain `TurboQuant` envelopes
 
 Failure interpretation:
 - if the checkpoint path is inaccessible, the test fails immediately with a path/configuration message
-- if top-1 diverges on any step, treat that as real-checkpoint parity drift on the currently supported narrow path
-- if enabled decode-prefix layer count is lower than expected, inspect sliding/shared-KV gating before widening scope
+- if `first_divergence_step` is not `None`, treat that step as the start of open-loop parity drift on the currently supported narrow path or its dense-fallback restore boundary
+- if top-1 diverges on any step, treat that as real-checkpoint parity drift on the currently supported path/boundary
+- if enabled decode-prefix layer count is `0/N` on a mixed sliding/shared-KV model, that is now expected bounded behavior rather than a sliding/shared-KV support claim
 
 ## Rollback
 
