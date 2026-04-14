@@ -107,6 +107,7 @@ pub enum TurboQuantValuePayload {
         row_width: usize,
         scales: Vec<f32>,
         bytes: Vec<u8>,
+        prepared_rows_f32: Tensor,
     },
 }
 
@@ -668,6 +669,10 @@ impl TurboQuantBackend {
             row_width,
             scales,
             bytes: quants.into_iter().map(|value| value as u8).collect(),
+            prepared_rows_f32: value
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .reshape((value_shape[1], value_shape[2], row_width))?,
         })
     }
 
@@ -681,6 +686,7 @@ impl TurboQuantBackend {
                 row_width,
                 scales,
                 bytes,
+                ..
             } => Int8RowwiseKvBackend::dequantize_rowwise(scales, *row_width, bytes),
         }?;
 
@@ -695,7 +701,7 @@ impl TurboQuantBackend {
         Ok(values)
     }
 
-    fn weighted_value_from_rowwise_payload(
+    fn weighted_value_from_rowwise_payload_reference(
         &self,
         attn_weights: &Tensor,
         value_shape: &[usize],
@@ -709,6 +715,7 @@ impl TurboQuantBackend {
             row_width,
             scales,
             bytes,
+            ..
         } = value
         else {
             return Ok(None);
@@ -726,7 +733,7 @@ impl TurboQuantBackend {
 
         let (batch, num_heads, q_len, weight_prefix_len) = attn_weights.dims4()?;
         if batch != 1
-            || q_len != 1
+            || q_len == 0
             || num_heads != num_kv_heads * num_kv_groups
             || weight_prefix_len != prefix_len
         {
@@ -741,32 +748,113 @@ impl TurboQuantBackend {
         let weights = attn_weights
             .to_device(&Device::Cpu)?
             .to_dtype(DType::F32)?
-            .reshape((num_heads, prefix_len))?
-            .to_vec2::<f32>()?;
-        let mut aggregated = vec![0.0_f32; num_heads * row_width];
+            .reshape((num_heads, q_len, prefix_len))?
+            .to_vec3::<f32>()?;
+        let mut aggregated = vec![0.0_f32; num_heads * q_len * row_width];
         for head_idx in 0..num_heads {
             let kv_head_idx = head_idx / num_kv_groups;
-            let out_row = &mut aggregated[head_idx * row_width..(head_idx + 1) * row_width];
-            for pos_idx in 0..prefix_len {
-                let weight = weights[head_idx][pos_idx];
-                if weight == 0.0 {
-                    continue;
-                }
-                let row_idx = kv_head_idx * prefix_len + pos_idx;
-                let scale = scales[row_idx];
-                if scale == 0.0 {
-                    continue;
-                }
-                let row_bytes = &bytes[row_idx * row_width..(row_idx + 1) * row_width];
-                for (dst, quantized) in out_row.iter_mut().zip(row_bytes.iter()) {
-                    *dst += weight * ((*quantized as i8) as f32 * scale);
+            for q_idx in 0..q_len {
+                let output_offset = (head_idx * q_len + q_idx) * row_width;
+                let out_row = &mut aggregated[output_offset..output_offset + row_width];
+                for pos_idx in 0..prefix_len {
+                    let weight = weights[head_idx][q_idx][pos_idx];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    let row_idx = kv_head_idx * prefix_len + pos_idx;
+                    let scale = scales[row_idx];
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let row_bytes = &bytes[row_idx * row_width..(row_idx + 1) * row_width];
+                    for (dst, quantized) in out_row.iter_mut().zip(row_bytes.iter()) {
+                        *dst += weight * ((*quantized as i8) as f32 * scale);
+                    }
                 }
             }
         }
 
         Ok(Some(
-            Tensor::from_vec(aggregated, (1, num_heads, 1, *row_width), &Device::Cpu)?
+            Tensor::from_vec(aggregated, (1, num_heads, q_len, *row_width), &Device::Cpu)?
                 .to_device(target_device)?
+                .to_dtype(target_dtype)?,
+        ))
+    }
+
+    fn weighted_value_from_rowwise_payload_hot_path(
+        &self,
+        attn_weights: &Tensor,
+        value_shape: &[usize],
+        value: &TurboQuantValuePayload,
+        num_kv_heads: usize,
+        num_kv_groups: usize,
+        target_device: &Device,
+        target_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        let TurboQuantValuePayload::RowwiseInt8 {
+            row_width,
+            prepared_rows_f32,
+            ..
+        } = value
+        else {
+            return Ok(None);
+        };
+
+        if value_shape.len() != 4 || value_shape[0] != 1 {
+            return Ok(None);
+        }
+
+        let prefix_len = value_shape[2];
+        let stored_kv_heads = value_shape[1];
+        if stored_kv_heads != num_kv_heads || value_shape[3] != *row_width {
+            return Ok(None);
+        }
+
+        let (batch, num_heads, q_len, weight_prefix_len) = attn_weights.dims4()?;
+        if batch != 1
+            || q_len == 0
+            || num_heads != num_kv_heads * num_kv_groups
+            || weight_prefix_len != prefix_len
+        {
+            return Ok(None);
+        }
+
+        let prepared_shape = prepared_rows_f32.shape().dims();
+        if prepared_shape != [stored_kv_heads, prefix_len, *row_width] {
+            bail!(
+                "turboquant prepared V cache shape mismatch: got {:?}, expected [{}, {}, {}]",
+                prepared_shape,
+                stored_kv_heads,
+                prefix_len,
+                row_width
+            );
+        }
+
+        let weights = attn_weights
+            .to_device(target_device)?
+            .to_dtype(DType::F32)?
+            .reshape((num_kv_heads, num_kv_groups, q_len, prefix_len))?;
+        let prepared_rows = prepared_rows_f32.to_device(target_device)?;
+
+        let mut per_kv_outputs = Vec::with_capacity(num_kv_heads);
+        for kv_head_idx in 0..num_kv_heads {
+            let head_weights = weights
+                .narrow(0, kv_head_idx, 1)?
+                .reshape((num_kv_groups * q_len, prefix_len))?;
+            let head_values = prepared_rows
+                .narrow(0, kv_head_idx, 1)?
+                .reshape((prefix_len, *row_width))?;
+            per_kv_outputs.push(head_weights.matmul(&head_values)?.reshape((
+                num_kv_groups,
+                q_len,
+                *row_width,
+            ))?);
+        }
+
+        let per_kv_refs = per_kv_outputs.iter().collect::<Vec<_>>();
+        Ok(Some(
+            Tensor::cat(&per_kv_refs, 0)?
+                .reshape((1, num_heads, q_len, *row_width))?
                 .to_dtype(target_dtype)?,
         ))
     }
@@ -1447,6 +1535,7 @@ impl KvCacheBackend for TurboQuantBackend {
                         row_width,
                         scales,
                         bytes,
+                        prepared_rows_f32,
                     } => {
                         let expected_row_width = *stored.value_shape.last().unwrap_or(&0);
                         if *row_width != expected_row_width {
@@ -1470,6 +1559,24 @@ impl KvCacheBackend for TurboQuantBackend {
                         }
                         if bytes.len() != stored.value_shape.iter().product::<usize>() {
                             bail!("turboquant V byte length mismatch for layer {}", layer_idx);
+                        }
+                        let expected_prepared_shape =
+                            [stored.value_shape[1], stored.value_shape[2], *row_width];
+                        if prepared_rows_f32.shape().dims() != expected_prepared_shape {
+                            bail!(
+                                "turboquant prepared V cache shape mismatch for layer {}: stored={:?} expected={:?}",
+                                layer_idx,
+                                prepared_rows_f32.shape().dims(),
+                                expected_prepared_shape
+                            );
+                        }
+                        if prepared_rows_f32.dtype() != DType::F32 {
+                            bail!(
+                                "turboquant prepared V cache dtype mismatch for layer {}: stored={:?} expected={:?}",
+                                layer_idx,
+                                prepared_rows_f32.dtype(),
+                                DType::F32
+                            );
                         }
                     }
                 }
@@ -1526,7 +1633,7 @@ impl KvCacheBackend for TurboQuantBackend {
                 self.backend_id()
             );
         };
-        self.weighted_value_from_rowwise_payload(
+        match self.weighted_value_from_rowwise_payload_hot_path(
             attn_weights,
             &stored.value_shape,
             value,
@@ -1534,7 +1641,18 @@ impl KvCacheBackend for TurboQuantBackend {
             num_kv_groups,
             target_device,
             target_dtype,
-        )
+        )? {
+            Some(weighted) => Ok(Some(weighted)),
+            None => self.weighted_value_from_rowwise_payload_reference(
+                attn_weights,
+                &stored.value_shape,
+                value,
+                num_kv_heads,
+                num_kv_groups,
+                target_device,
+                target_dtype,
+            ),
+        }
     }
 }
 
@@ -1765,7 +1883,9 @@ mod tests {
             .weighted_value_prefix(&attn_weights, &stored, 1, 2, &Device::Cpu, DType::F32)
             .unwrap()
             .unwrap()
-            .to_vec3::<f32>()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
             .unwrap();
 
         let expected = vec![
@@ -1781,10 +1901,269 @@ mod tests {
                 .collect::<Vec<_>>(),
         ];
 
-        for (actual_row, expected_row) in aggregated.iter().zip(expected.iter()) {
-            for (actual, expected) in actual_row[0].iter().zip(expected_row.iter()) {
+        for (actual_row, expected_row) in aggregated.chunks(8).zip(expected.iter()) {
+            for (actual, expected) in actual_row.iter().zip(expected_row.iter()) {
                 assert!(
                     (*actual - *expected).abs() <= 0.02_f32,
+                    "actual={actual} expected={expected}"
+                );
+            }
+        }
+
+        let KvLayerPayload::TurboQuant { value, .. } = &stored.payload else {
+            panic!("expected turboquant payload")
+        };
+        let TurboQuantValuePayload::RowwiseInt8 {
+            prepared_rows_f32, ..
+        } = value
+        else {
+            panic!("expected rowwise V payload")
+        };
+        assert_eq!(prepared_rows_f32.dims3().unwrap(), (1, 2, 8));
+    }
+
+    #[test]
+    fn turboquant_weighted_value_prefix_hot_path_matches_prepared_dense_cache() {
+        let backend = TurboQuantBackend;
+        let key = Tensor::zeros((1, 2, 3, 8), DType::F32, &Device::Cpu).unwrap();
+        let value = Tensor::from_vec(
+            vec![
+                0.10_f32, 0.20, 0.30, 0.40, -0.10, -0.20, -0.30, -0.40, 0.50_f32, 0.60, 0.70, 0.80,
+                -0.50, -0.60, -0.70, -0.80, 0.90_f32, 1.00, 1.10, 1.20, -0.90, -1.00, -1.10, -1.20,
+                -0.15_f32, -0.25, -0.35, -0.45, 0.15, 0.25, 0.35, 0.45, -0.55_f32, -0.65, -0.75,
+                -0.85, 0.55, 0.65, 0.75, 0.85, -0.95_f32, -1.05, -1.15, -1.25, 0.95, 1.05, 1.15,
+                1.25,
+            ],
+            (1, 2, 3, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let stored = backend
+            .export_layer(0, Some((key, value)))
+            .unwrap()
+            .unwrap();
+        let attn_weights = Tensor::from_vec(
+            vec![
+                0.70_f32, 0.20, 0.10, 0.05_f32, 0.15, 0.80, 0.60_f32, 0.25, 0.15, 0.20_f32, 0.30,
+                0.50,
+            ],
+            (1, 4, 1, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let KvLayerPayload::TurboQuant { value, .. } = &stored.payload else {
+            panic!("expected turboquant payload")
+        };
+        let hot = backend
+            .weighted_value_from_rowwise_payload_hot_path(
+                &attn_weights,
+                &stored.value_shape,
+                value,
+                2,
+                2,
+                &Device::Cpu,
+                DType::F32,
+            )
+            .unwrap()
+            .unwrap();
+        let prepared_rows_f32 = match value {
+            TurboQuantValuePayload::RowwiseInt8 {
+                prepared_rows_f32, ..
+            } => prepared_rows_f32,
+            TurboQuantValuePayload::Dense(_) => panic!("expected rowwise V payload"),
+        };
+        let dense_reference = attn_weights
+            .reshape((2, 2, 3))
+            .unwrap()
+            .narrow(0, 0, 1)
+            .unwrap()
+            .reshape((2, 3))
+            .unwrap()
+            .matmul(
+                &prepared_rows_f32
+                    .narrow(0, 0, 1)
+                    .unwrap()
+                    .reshape((3, 8))
+                    .unwrap(),
+            )
+            .unwrap();
+        let dense_reference_1 = attn_weights
+            .reshape((2, 2, 3))
+            .unwrap()
+            .narrow(0, 1, 1)
+            .unwrap()
+            .reshape((2, 3))
+            .unwrap()
+            .matmul(
+                &prepared_rows_f32
+                    .narrow(0, 1, 1)
+                    .unwrap()
+                    .reshape((3, 8))
+                    .unwrap(),
+            )
+            .unwrap();
+        let dense_reference = Tensor::cat(&[&dense_reference, &dense_reference_1], 0)
+            .unwrap()
+            .reshape((1, 4, 1, 8))
+            .unwrap();
+
+        let hot = hot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let reference = dense_reference
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(hot.len(), reference.len());
+        for (actual, expected) in hot.iter().zip(reference.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn turboquant_weighted_value_prefix_supports_multi_token_decode_queries() {
+        let backend = TurboQuantBackend;
+        let key = Tensor::zeros((1, 2, 3, 8), DType::F32, &Device::Cpu).unwrap();
+        let value = Tensor::from_vec(
+            vec![
+                0.10_f32, 0.20, 0.30, 0.40, -0.10, -0.20, -0.30, -0.40, 0.50_f32, 0.60, 0.70, 0.80,
+                -0.50, -0.60, -0.70, -0.80, 0.90_f32, 1.00, 1.10, 1.20, -0.90, -1.00, -1.10, -1.20,
+                -0.15_f32, -0.25, -0.35, -0.45, 0.15, 0.25, 0.35, 0.45, -0.55_f32, -0.65, -0.75,
+                -0.85, 0.55, 0.65, 0.75, 0.85, -0.95_f32, -1.05, -1.15, -1.25, 0.95, 1.05, 1.15,
+                1.25,
+            ],
+            (1, 2, 3, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let stored = backend
+            .export_layer(0, Some((key, value)))
+            .unwrap()
+            .unwrap();
+        let attn_weights = Tensor::from_vec(
+            vec![
+                0.70_f32, 0.20, 0.10, 0.05_f32, 0.15, 0.80, 0.10_f32, 0.30, 0.60, 0.45_f32, 0.35,
+                0.20, 0.60_f32, 0.25, 0.15, 0.20_f32, 0.30, 0.50, 0.25_f32, 0.50, 0.25, 0.55_f32,
+                0.15, 0.30,
+            ],
+            (1, 4, 2, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let KvLayerPayload::TurboQuant { value, .. } = &stored.payload else {
+            panic!("expected turboquant payload")
+        };
+        let hot = backend
+            .weighted_value_prefix(&attn_weights, &stored, 2, 2, &Device::Cpu, DType::F32)
+            .unwrap()
+            .unwrap();
+        let prepared_rows_f32 = match value {
+            TurboQuantValuePayload::RowwiseInt8 {
+                prepared_rows_f32, ..
+            } => prepared_rows_f32,
+            TurboQuantValuePayload::Dense(_) => panic!("expected rowwise V payload"),
+        };
+        let weights = attn_weights.reshape((2, 2, 2, 3)).unwrap();
+        let mut per_kv_outputs = Vec::new();
+        for kv_head_idx in 0..2 {
+            let dense_reference = weights
+                .narrow(0, kv_head_idx, 1)
+                .unwrap()
+                .reshape((4, 3))
+                .unwrap()
+                .matmul(
+                    &prepared_rows_f32
+                        .narrow(0, kv_head_idx, 1)
+                        .unwrap()
+                        .reshape((3, 8))
+                        .unwrap(),
+                )
+                .unwrap()
+                .reshape((2, 2, 8))
+                .unwrap();
+            per_kv_outputs.push(dense_reference);
+        }
+        let per_kv_refs = per_kv_outputs.iter().collect::<Vec<_>>();
+        let dense_reference = Tensor::cat(&per_kv_refs, 0)
+            .unwrap()
+            .reshape((1, 4, 2, 8))
+            .unwrap();
+
+        let hot = hot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let reference = dense_reference
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(hot.len(), reference.len());
+        for (actual, expected) in hot.iter().zip(reference.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn turboquant_weighted_value_prefix_supports_multi_token_decode_queries_single_kv_head() {
+        let backend = TurboQuantBackend;
+        let key = Tensor::zeros((1, 1, 2, 8), DType::F32, &Device::Cpu).unwrap();
+        let value_rows = vec![
+            vec![0.1_f32, 0.2, 0.3, 0.4, -0.1, -0.2, -0.3, -0.4],
+            vec![0.5_f32, 0.6, 0.7, 0.8, -0.5, -0.6, -0.7, -0.8],
+        ];
+        let value = Tensor::from_vec(value_rows.concat(), (1, 1, 2, 8), &Device::Cpu).unwrap();
+        let stored = backend
+            .export_layer(0, Some((key, value)))
+            .unwrap()
+            .unwrap();
+
+        let attn_weights = Tensor::from_vec(
+            vec![0.75_f32, 0.25, 0.10, 0.90, 0.30_f32, 0.70, 0.65_f32, 0.35],
+            (1, 2, 2, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let aggregated = backend
+            .weighted_value_prefix(&attn_weights, &stored, 1, 2, &Device::Cpu, DType::F32)
+            .unwrap()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let expected = vec![
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.75 * lhs + 0.25 * rhs)
+                .collect::<Vec<_>>(),
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.10 * lhs + 0.90 * rhs)
+                .collect::<Vec<_>>(),
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.30 * lhs + 0.70 * rhs)
+                .collect::<Vec<_>>(),
+            value_rows[0]
+                .iter()
+                .zip(value_rows[1].iter())
+                .map(|(lhs, rhs)| 0.65 * lhs + 0.35 * rhs)
+                .collect::<Vec<_>>(),
+        ];
+
+        for (actual_row, expected_row) in aggregated.chunks(8).zip(expected.iter()) {
+            for (actual, expected) in actual_row.iter().zip(expected_row.iter()) {
+                assert!(
+                    (actual - expected).abs() <= 0.02_f32,
                     "actual={actual} expected={expected}"
                 );
             }

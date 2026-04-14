@@ -1009,6 +1009,35 @@ impl Model {
         self.inner.active_kv_cache_bytes()
     }
 
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.inner.setup_batch_decode(seq_kv_caches, extra_room)
+    }
+
+    pub fn step_batch_decode_with_input_ids(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.inner
+            .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
+    }
+
+    pub fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.inner
+            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    }
+
     /// Offload Gemma4 MoE expert tensors to CPU under memory pressure.
     /// Returns number of moved tensor groups.
     pub fn offload_experts_to_cpu(&mut self) -> usize {
